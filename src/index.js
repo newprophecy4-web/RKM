@@ -3572,4 +3572,4 @@ export default {
         method === "DELETE"
       ) {
         const admin =
-          await requireAdminrequireAdmin
+          await requireAdmin
