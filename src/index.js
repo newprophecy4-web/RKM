@@ -3572,4 +3572,2230 @@ export default {
         method === "DELETE"
       ) {
         const admin =
-          await requireAdmin
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const idValue =
+          path.split("/")[4];
+
+        await env.DB
+          .prepare(
+            `
+            DELETE FROM class_subjects
+            WHERE id = ?
+            `
+          )
+          .bind(idValue)
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "delete",
+          "class_subject",
+          idValue
+        );
+
+        return ok(
+          {
+            message:
+              "Class subject deleted",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN EXAM CREATE
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/exams" &&
+        method === "POST"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const body =
+          await getBody(request);
+
+        if (
+          !body.exam_type_id ||
+          !body.name
+        ) {
+          return error(
+            "exam_type_id and name are required",
+            400,
+            origin
+          );
+        }
+
+        const examId =
+          makeId("exam");
+
+        await env.DB
+          .prepare(
+            `
+            INSERT INTO exams (
+              id,
+              exam_type_id,
+              name,
+              name_bn,
+              academic_year_id,
+              class_id,
+              group_id,
+              start_date,
+              end_date,
+              status,
+              published,
+              created_by
+            )
+            VALUES (
+              ?, ?, ?, ?, ?, ?, ?,
+              ?, ?, ?, ?, ?
+            )
+            `
+          )
+          .bind(
+            examId,
+            body.exam_type_id,
+            body.name,
+            body.name_bn || null,
+            body.academic_year_id ||
+              null,
+            body.class_id || null,
+            body.group_id || null,
+            body.start_date || null,
+            body.end_date || null,
+            body.status ||
+              "upcoming",
+            body.published
+              ? 1
+              : 0,
+            admin.user.id
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "exam",
+          examId,
+          body.name
+        );
+
+        return ok(
+          {
+            message:
+              "Exam created",
+            id:
+              examId,
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN EXAM UPDATE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/exams\/[^/]+$/
+        ) &&
+        method === "PATCH"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const examId =
+          path.split("/")[4];
+
+        const body =
+          await getBody(request);
+
+        const existing =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM exams
+              WHERE id = ?
+              `
+            )
+            .bind(examId)
+            .first();
+
+        if (!existing) {
+          return error(
+            "Exam not found",
+            404,
+            origin
+          );
+        }
+
+        await env.DB
+          .prepare(
+            `
+            UPDATE exams
+            SET
+              exam_type_id = ?,
+              name = ?,
+              name_bn = ?,
+              academic_year_id = ?,
+              class_id = ?,
+              group_id = ?,
+              start_date = ?,
+              end_date = ?,
+              status = ?,
+              published = ?,
+              updated_at =
+                CURRENT_TIMESTAMP
+            WHERE id = ?
+            `
+          )
+          .bind(
+            body.exam_type_id ??
+              existing.exam_type_id,
+            body.name ??
+              existing.name,
+            body.name_bn ??
+              existing.name_bn,
+            body.academic_year_id ??
+              existing.academic_year_id,
+            body.class_id ??
+              existing.class_id,
+            body.group_id ??
+              existing.group_id,
+            body.start_date ??
+              existing.start_date,
+            body.end_date ??
+              existing.end_date,
+            body.status ??
+              existing.status,
+            body.published == null
+              ? existing.published
+              : body.published
+                ? 1
+                : 0,
+            examId
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "update",
+          "exam",
+          examId
+        );
+
+        return ok(
+          {
+            message:
+              "Exam updated",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN EXAM DELETE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/exams\/[^/]+$/
+        ) &&
+        method === "DELETE"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const examId =
+          path.split("/")[4];
+
+        await env.DB
+          .prepare(
+            `
+            DELETE FROM exams
+            WHERE id = ?
+            `
+          )
+          .bind(examId)
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "delete",
+          "exam",
+          examId
+        );
+
+        return ok(
+          {
+            message:
+              "Exam deleted",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN EXAM SUBJECT
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/exam-subjects" &&
+        method === "POST"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const body =
+          await getBody(request);
+
+        if (
+          !body.exam_id ||
+          !body.subject_id
+        ) {
+          return error(
+            "exam_id and subject_id are required",
+            400,
+            origin
+          );
+        }
+
+        const idValue =
+          makeId("exam_subject");
+
+        await env.DB
+          .prepare(
+            `
+            INSERT INTO exam_subjects (
+              id,
+              exam_id,
+              subject_id,
+              full_marks,
+              pass_marks,
+              exam_date,
+              start_time,
+              end_time,
+              display_order
+            )
+            VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            `
+          )
+          .bind(
+            idValue,
+            body.exam_id,
+            body.subject_id,
+            Number(
+              body.full_marks ??
+                100
+            ),
+            Number(
+              body.pass_marks ??
+                33
+            ),
+            body.exam_date ||
+              null,
+            body.start_time ||
+              null,
+            body.end_time ||
+              null,
+            Number(
+              body.display_order ||
+                0
+            )
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "exam_subject",
+          idValue
+        );
+
+        return ok(
+          {
+            message:
+              "Exam subject created",
+            id:
+              idValue,
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN EXAM SUBJECT DELETE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/exam-subjects\/[^/]+$/
+        ) &&
+        method === "DELETE"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const idValue =
+          path.split("/")[4];
+
+        await env.DB
+          .prepare(
+            `
+            DELETE FROM exam_subjects
+            WHERE id = ?
+            `
+          )
+          .bind(idValue)
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "delete",
+          "exam_subject",
+          idValue
+        );
+
+        return ok(
+          {
+            message:
+              "Exam subject deleted",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN MARKSHEET CREATE
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/marksheets" &&
+        method === "POST"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const body =
+          await getBody(request);
+
+        if (
+          !body.exam_id ||
+          !body.academic_year_id ||
+          !body.class_id ||
+          !body.student_name ||
+          body.roll_number == null
+        ) {
+          return error(
+            "exam_id, academic_year_id, class_id, student_name and roll_number are required",
+            400,
+            origin
+          );
+        }
+
+        const rollNumber =
+          integer(
+            body.roll_number
+          );
+
+        if (
+          rollNumber === null
+        ) {
+          return error(
+            "roll_number must be an integer",
+            400,
+            origin
+          );
+        }
+
+        const marksheetId =
+          makeId("marksheet");
+
+        await env.DB
+          .prepare(
+            `
+            INSERT INTO marksheets (
+              id,
+              exam_id,
+              academic_year_id,
+              class_id,
+              group_id,
+              student_name,
+              roll_number,
+              total_marks,
+              percentage,
+              grade,
+              gpa,
+              result_status,
+              rank,
+              published,
+              created_by
+            )
+            VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?,
+              ?, ?, ?, ?, ?, ?, ?
+            )
+            `
+          )
+          .bind(
+            marksheetId,
+            body.exam_id,
+            body.academic_year_id,
+            body.class_id,
+            body.group_id || null,
+            body.student_name,
+            rollNumber,
+            Number(
+              body.total_marks || 0
+            ),
+            Number(
+              body.percentage || 0
+            ),
+            body.grade || null,
+            body.gpa == null
+              ? null
+              : Number(body.gpa),
+            body.result_status ||
+              null,
+            body.rank == null
+              ? null
+              : Number(body.rank),
+            body.published
+              ? 1
+              : 0,
+            admin.user.id
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "marksheet",
+          marksheetId,
+          body.student_name
+        );
+
+        return ok(
+          {
+            message:
+              "Marksheet created",
+            id:
+              marksheetId,
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN MARKSHEET UPDATE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/marksheets\/[^/]+$/
+        ) &&
+        method === "PATCH"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const marksheetId =
+          path.split("/")[4];
+
+        const body =
+          await getBody(request);
+
+        const existing =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM marksheets
+              WHERE id = ?
+              `
+            )
+            .bind(
+              marksheetId
+            )
+            .first();
+
+        if (!existing) {
+          return error(
+            "Marksheet not found",
+            404,
+            origin
+          );
+        }
+
+        await env.DB
+          .prepare(
+            `
+            UPDATE marksheets
+            SET
+              exam_id = ?,
+              academic_year_id = ?,
+              class_id = ?,
+              group_id = ?,
+              student_name = ?,
+              roll_number = ?,
+              total_marks = ?,
+              percentage = ?,
+              grade = ?,
+              gpa = ?,
+              result_status = ?,
+              rank = ?,
+              published = ?,
+              updated_at =
+                CURRENT_TIMESTAMP
+            WHERE id = ?
+            `
+          )
+          .bind(
+            body.exam_id ??
+              existing.exam_id,
+            body.academic_year_id ??
+              existing.academic_year_id,
+            body.class_id ??
+              existing.class_id,
+            body.group_id ??
+              existing.group_id,
+            body.student_name ??
+              existing.student_name,
+            body.roll_number ==
+              null
+              ? existing.roll_number
+              : Number(
+                  body.roll_number
+                ),
+            body.total_marks ==
+              null
+              ? existing.total_marks
+              : Number(
+                  body.total_marks
+                ),
+            body.percentage ==
+              null
+              ? existing.percentage
+              : Number(
+                  body.percentage
+                ),
+            body.grade ??
+              existing.grade,
+            body.gpa == null
+              ? existing.gpa
+              : Number(
+                  body.gpa
+                ),
+            body.result_status ??
+              existing.result_status,
+            body.rank == null
+              ? existing.rank
+              : Number(
+                  body.rank
+                ),
+            body.published == null
+              ? existing.published
+              : body.published
+                ? 1
+                : 0,
+            marksheetId
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "update",
+          "marksheet",
+          marksheetId
+        );
+
+        return ok(
+          {
+            message:
+              "Marksheet updated",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN MARKSHEET DELETE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/marksheets\/[^/]+$/
+        ) &&
+        method === "DELETE"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const marksheetId =
+          path.split("/")[4];
+
+        await env.DB
+          .prepare(
+            `
+            DELETE FROM marksheets
+            WHERE id = ?
+            `
+          )
+          .bind(
+            marksheetId
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "delete",
+          "marksheet",
+          marksheetId
+        );
+
+        return ok(
+          {
+            message:
+              "Marksheet deleted",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN MARKSHEET SUBJECT CREATE
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/marksheet-subjects" &&
+        method === "POST"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const body =
+          await getBody(request);
+
+        if (
+          !body.marksheet_id ||
+          !body.subject_name
+        ) {
+          return error(
+            "marksheet_id and subject_name are required",
+            400,
+            origin
+          );
+        }
+
+        const subjectRowId =
+          makeId("mark");
+
+        await env.DB
+          .prepare(
+            `
+            INSERT INTO marksheet_subjects (
+              id,
+              marksheet_id,
+              subject_id,
+              subject_name,
+              full_marks,
+              pass_marks,
+              obtained_marks,
+              grade,
+              grade_point,
+              remarks,
+              display_order
+            )
+            VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            `
+          )
+          .bind(
+            subjectRowId,
+            body.marksheet_id,
+            body.subject_id || null,
+            body.subject_name,
+            Number(
+              body.full_marks || 100
+            ),
+            Number(
+              body.pass_marks || 33
+            ),
+            Number(
+              body.obtained_marks || 0
+            ),
+            body.grade || null,
+            body.grade_point == null
+              ? null
+              : Number(
+                  body.grade_point
+                ),
+            body.remarks || null,
+            Number(
+              body.display_order || 0
+            )
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "marksheet_subject",
+          subjectRowId
+        );
+
+        return ok(
+          {
+            message:
+              "Marksheet subject created",
+            id:
+              subjectRowId,
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN MARKSHEET SUBJECT UPDATE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/marksheet-subjects\/[^/]+$/
+        ) &&
+        method === "PATCH"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const subjectRowId =
+          path.split("/")[4];
+
+        const body =
+          await getBody(request);
+
+        const existing =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM marksheet_subjects
+              WHERE id = ?
+              `
+            )
+            .bind(
+              subjectRowId
+            )
+            .first();
+
+        if (!existing) {
+          return error(
+            "Marksheet subject not found",
+            404,
+            origin
+          );
+        }
+
+        await env.DB
+          .prepare(
+            `
+            UPDATE marksheet_subjects
+            SET
+              marksheet_id = ?,
+              subject_id = ?,
+              subject_name = ?,
+              full_marks = ?,
+              pass_marks = ?,
+              obtained_marks = ?,
+              grade = ?,
+              grade_point = ?,
+              remarks = ?,
+              display_order = ?,
+              updated_at =
+                CURRENT_TIMESTAMP
+            WHERE id = ?
+            `
+          )
+          .bind(
+            body.marksheet_id ??
+              existing.marksheet_id,
+            body.subject_id ??
+              existing.subject_id,
+            body.subject_name ??
+              existing.subject_name,
+            body.full_marks ==
+              null
+              ? existing.full_marks
+              : Number(
+                  body.full_marks
+                ),
+            body.pass_marks ==
+              null
+              ? existing.pass_marks
+              : Number(
+                  body.pass_marks
+                ),
+            body.obtained_marks ==
+              null
+              ? existing.obtained_marks
+              : Number(
+                  body.obtained_marks
+                ),
+            body.grade ??
+              existing.grade,
+            body.grade_point == null
+              ? existing.grade_point
+              : Number(
+                  body.grade_point
+                ),
+            body.remarks ??
+              existing.remarks,
+            body.display_order ==
+              null
+              ? existing.display_order
+              : Number(
+                  body.display_order
+                ),
+            subjectRowId
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "update",
+          "marksheet_subject",
+          subjectRowId
+        );
+
+        return ok(
+          {
+            message:
+              "Marksheet subject updated",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN MARKSHEET SUBJECT DELETE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/marksheet-subjects\/[^/]+$/
+        ) &&
+        method === "DELETE"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const subjectRowId =
+          path.split("/")[4];
+
+        await env.DB
+          .prepare(
+            `
+            DELETE FROM marksheet_subjects
+            WHERE id = ?
+            `
+          )
+          .bind(
+            subjectRowId
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "delete",
+          "marksheet_subject",
+          subjectRowId
+        );
+
+        return ok(
+          {
+            message:
+              "Marksheet subject deleted",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN MANUAL RANK
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/marksheet-ranks" &&
+        method === "POST"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const body =
+          await getBody(request);
+
+        const rank =
+          integer(
+            body.rank_number
+          );
+
+        if (
+          !body.marksheet_id ||
+          rank === null ||
+          rank < 1
+        ) {
+          return error(
+            "marksheet_id and valid rank_number are required",
+            400,
+            origin
+          );
+        }
+
+        const rankId =
+          makeId("rank");
+
+        await env.DB
+          .prepare(
+            `
+            INSERT INTO marksheet_ranks (
+              id,
+              marksheet_id,
+              rank_number,
+              assigned_by
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(marksheet_id)
+            DO UPDATE SET
+              rank_number =
+                excluded.rank_number,
+              assigned_by =
+                excluded.assigned_by,
+              assigned_at =
+                CURRENT_TIMESTAMP
+            `
+          )
+          .bind(
+            rankId,
+            body.marksheet_id,
+            rank,
+            admin.user.id
+          )
+          .run();
+
+        /*
+          Keep marksheets.rank synchronized
+          with manual rank table.
+        */
+
+        await env.DB
+          .prepare(
+            `
+            UPDATE marksheets
+            SET
+              rank = ?,
+              updated_at =
+                CURRENT_TIMESTAMP
+            WHERE id = ?
+            `
+          )
+          .bind(
+            rank,
+            body.marksheet_id
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "assign_rank",
+          "marksheet",
+          body.marksheet_id,
+          `Rank ${rank}`
+        );
+
+        return ok(
+          {
+            message:
+              "Rank assigned",
+            rank,
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN PROMOTION CREATE
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/promotions" &&
+        method === "POST"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const body =
+          await getBody(request);
+
+        const required = [
+          "from_academic_year_id",
+          "to_academic_year_id",
+          "from_class_id",
+          "to_class_id",
+          "student_name",
+          "previous_roll",
+          "previous_rank",
+          "new_roll",
+        ];
+
+        for (
+          const field of required
+        ) {
+          if (
+            body[field] == null ||
+            body[field] === ""
+          ) {
+            return error(
+              `${field} is required`,
+              400,
+              origin
+            );
+          }
+        }
+
+        const promotionId =
+          makeId("promotion");
+
+        await env.DB
+          .prepare(
+            `
+            INSERT INTO promotions (
+              id,
+              from_academic_year_id,
+              to_academic_year_id,
+              from_class_id,
+              to_class_id,
+              group_id,
+              student_name,
+              previous_roll,
+              previous_rank,
+              new_roll,
+              status,
+              created_by
+            )
+            VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            `
+          )
+          .bind(
+            promotionId,
+            body.from_academic_year_id,
+            body.to_academic_year_id,
+            body.from_class_id,
+            body.to_class_id,
+            body.group_id || null,
+            body.student_name,
+            Number(
+              body.previous_roll
+            ),
+            Number(
+              body.previous_rank
+            ),
+            Number(
+              body.new_roll
+            ),
+            body.status ||
+              "promoted",
+            admin.user.id
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "promotion",
+          promotionId,
+          body.student_name
+        );
+
+        return ok(
+          {
+            message:
+              "Promotion record created",
+            id:
+              promotionId,
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         PUBLIC PROMOTIONS
+      =================================================== */
+
+      if (
+        path === "/api/promotions" &&
+        method === "GET"
+      ) {
+        const fromYear =
+          url.searchParams.get(
+            "from_academic_year_id"
+          );
+
+        const toYear =
+          url.searchParams.get(
+            "to_academic_year_id"
+          );
+
+        const classId =
+          url.searchParams.get(
+            "from_class_id"
+          );
+
+        let sql = `
+          SELECT
+            p.*,
+
+            fy.year AS from_year,
+            ty.year AS to_year,
+
+            fc.name AS from_class_name,
+            fc.name_bn AS from_class_name_bn,
+
+            tc.name AS to_class_name,
+            tc.name_bn AS to_class_name_bn,
+
+            g.name AS group_name,
+            g.name_bn AS group_name_bn
+
+          FROM promotions p
+
+          LEFT JOIN academic_years fy
+            ON fy.id =
+              p.from_academic_year_id
+
+          LEFT JOIN academic_years ty
+            ON ty.id =
+              p.to_academic_year_id
+
+          LEFT JOIN classes fc
+            ON fc.id =
+              p.from_class_id
+
+          LEFT JOIN classes tc
+            ON tc.id =
+              p.to_class_id
+
+          LEFT JOIN groups g
+            ON g.id =
+              p.group_id
+
+          WHERE 1 = 1
+        `;
+
+        const params = [];
+
+        if (fromYear) {
+          sql +=
+            " AND p.from_academic_year_id = ?";
+          params.push(fromYear);
+        }
+
+        if (toYear) {
+          sql +=
+            " AND p.to_academic_year_id = ?";
+          params.push(toYear);
+        }
+
+        if (classId) {
+          sql +=
+            " AND p.from_class_id = ?";
+          params.push(classId);
+        }
+
+        sql +=
+          " ORDER BY p.new_roll ASC";
+
+        const rows =
+          await env.DB
+            .prepare(sql)
+            .bind(...params)
+            .all();
+
+        return ok(
+          {
+            promotions:
+              rows.results || [],
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN EVENTS CREATE
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/events" &&
+        method === "POST"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const body =
+          await getBody(request);
+
+        if (
+          !body.title ||
+          !body.start_datetime
+        ) {
+          return error(
+            "title and start_datetime are required",
+            400,
+            origin
+          );
+        }
+
+        const eventId =
+          makeId("event");
+
+        await env.DB
+          .prepare(
+            `
+            INSERT INTO events (
+              id,
+              title,
+              description,
+              event_type,
+              start_datetime,
+              end_datetime,
+              location,
+              image_url,
+              status,
+              created_by
+            )
+            VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            `
+          )
+          .bind(
+            eventId,
+            body.title,
+            body.description || null,
+            body.event_type ||
+              "general",
+            body.start_datetime,
+            body.end_datetime ||
+              null,
+            body.location || null,
+            body.image_url || null,
+            body.status ||
+              "active",
+            admin.user.id
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "event",
+          eventId,
+          body.title
+        );
+
+        return ok(
+          {
+            message:
+              "Event created",
+            id:
+              eventId,
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN EVENTS UPDATE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/events\/[^/]+$/
+        ) &&
+        method === "PATCH"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const eventId =
+          path.split("/")[4];
+
+        const body =
+          await getBody(request);
+
+        const existing =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM events
+              WHERE id = ?
+              `
+            )
+            .bind(eventId)
+            .first();
+
+        if (!existing) {
+          return error(
+            "Event not found",
+            404,
+            origin
+          );
+        }
+
+        await env.DB
+          .prepare(
+            `
+            UPDATE events
+            SET
+              title = ?,
+              description = ?,
+              event_type = ?,
+              start_datetime = ?,
+              end_datetime = ?,
+              location = ?,
+              image_url = ?,
+              status = ?,
+              updated_at =
+                CURRENT_TIMESTAMP
+            WHERE id = ?
+            `
+          )
+          .bind(
+            body.title ??
+              existing.title,
+            body.description ??
+              existing.description,
+            body.event_type ??
+              existing.event_type,
+            body.start_datetime ??
+              existing.start_datetime,
+            body.end_datetime ??
+              existing.end_datetime,
+            body.location ??
+              existing.location,
+            body.image_url ??
+              existing.image_url,
+            body.status ??
+              existing.status,
+            eventId
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "update",
+          "event",
+          eventId
+        );
+
+        return ok(
+          {
+            message:
+              "Event updated",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN EVENTS DELETE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/events\/[^/]+$/
+        ) &&
+        method === "DELETE"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const eventId =
+          path.split("/")[4];
+
+        await env.DB
+          .prepare(
+            `
+            DELETE FROM events
+            WHERE id = ?
+            `
+          )
+          .bind(eventId)
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "delete",
+          "event",
+          eventId
+        );
+
+        return ok(
+          {
+            message:
+              "Event deleted",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN DOCUMENT CREATE
+         R2 KEY ONLY
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/documents" &&
+        method === "POST"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const body =
+          await getBody(request);
+
+        if (
+          !body.title ||
+          !body.file_name ||
+          !body.r2_key
+        ) {
+          return error(
+            "title, file_name and r2_key are required",
+            400,
+            origin
+          );
+        }
+
+        const documentId =
+          makeId("document");
+
+        await env.DB
+          .prepare(
+            `
+            INSERT INTO documents (
+              id,
+              title,
+              description,
+              file_name,
+              r2_key,
+              mime_type,
+              file_size,
+              category,
+              visibility,
+              uploaded_by
+            )
+            VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            `
+          )
+          .bind(
+            documentId,
+            body.title,
+            body.description || null,
+            body.file_name,
+            body.r2_key,
+            body.mime_type || null,
+            body.file_size == null
+              ? null
+              : Number(
+                  body.file_size
+                ),
+            body.category ||
+              "general",
+            body.visibility ||
+              "public",
+            admin.user.id
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "document",
+          documentId,
+          body.file_name
+        );
+
+        return ok(
+          {
+            message:
+              "Document created",
+            id:
+              documentId,
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN DOCUMENT DELETE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/documents\/[^/]+$/
+        ) &&
+        method === "DELETE"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const documentId =
+          path.split("/")[4];
+
+        const document =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM documents
+              WHERE id = ?
+              `
+            )
+            .bind(documentId)
+            .first();
+
+        if (!document) {
+          return error(
+            "Document not found",
+            404,
+            origin
+          );
+        }
+
+        if (
+          env.R2 &&
+          document.r2_key
+        ) {
+          try {
+            await env.R2.delete(
+              document.r2_key
+            );
+          } catch (err) {
+            console.error(
+              "R2 delete failed:",
+              err
+            );
+          }
+        }
+
+        await env.DB
+          .prepare(
+            `
+            DELETE FROM documents
+            WHERE id = ?
+            `
+          )
+          .bind(documentId)
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "delete",
+          "document",
+          documentId
+        );
+
+        return ok(
+          {
+            message:
+              "Document deleted",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         DOCUMENT DOWNLOAD
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/documents\/[^/]+\/download$/
+        ) &&
+        method === "GET"
+      ) {
+        const documentId =
+          path.split("/")[3];
+
+        const document =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM documents
+              WHERE id = ?
+              LIMIT 1
+              `
+            )
+            .bind(documentId)
+            .first();
+
+        if (!document) {
+          return error(
+            "Document not found",
+            404,
+            origin
+          );
+        }
+
+        if (
+          document.visibility !==
+          "public"
+        ) {
+          try {
+            await requireAuth(
+              request,
+              env
+            );
+          } catch {
+            return error(
+              "Authentication required",
+              401,
+              origin
+            );
+          }
+
+          if (
+            document.visibility ===
+            "admin"
+          ) {
+            try {
+              await requireAdmin(
+                request,
+                env
+              );
+            } catch {
+              return error(
+                "Admin access required",
+                403,
+                origin
+              );
+            }
+          }
+        }
+
+        if (
+          !env.R2 ||
+          !document.r2_key
+        ) {
+          return error(
+            "R2 document storage is not configured",
+            503,
+            origin
+          );
+        }
+
+        const object =
+          await env.R2.get(
+            document.r2_key
+          );
+
+        if (!object) {
+          return error(
+            "File not found in R2",
+            404,
+            origin
+          );
+        }
+
+        const headers =
+          new Headers();
+
+        object.writeHttpMetadata(
+          headers
+        );
+
+        headers.set(
+          "Access-Control-Allow-Origin",
+          origin
+        );
+
+        headers.set(
+          "Content-Disposition",
+          `inline; filename="${encodeURIComponent(
+            document.file_name
+          )}"`
+        );
+
+        return new Response(
+          object.body,
+          {
+            headers,
+          }
+        );
+      }
+
+      /* ===================================================
+         ADMIN CREATE NOTIFICATION
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/notifications" &&
+        method === "POST"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const body =
+          await getBody(request);
+
+        if (
+          !body.user_id ||
+          !body.title ||
+          !body.message
+        ) {
+          return error(
+            "user_id, title and message are required",
+            400,
+            origin
+          );
+        }
+
+        const notificationId =
+          makeId("notification");
+
+        await env.DB
+          .prepare(
+            `
+            INSERT INTO notifications (
+              id,
+              user_id,
+              title,
+              message,
+              type,
+              reference_type,
+              reference_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            `
+          )
+          .bind(
+            notificationId,
+            body.user_id,
+            body.title,
+            body.message,
+            body.type ||
+              "general",
+            body.reference_type ||
+              null,
+            body.reference_id ||
+              null
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "notification",
+          notificationId
+        );
+
+        return ok(
+          {
+            message:
+              "Notification created",
+            id:
+              notificationId,
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN GRADING SCALE CREATE
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/grading-scale" &&
+        method === "POST"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const body =
+          await getBody(request);
+
+        if (
+          body.min_marks == null ||
+          body.max_marks == null ||
+          !body.grade ||
+          body.grade_point == null
+        ) {
+          return error(
+            "min_marks, max_marks, grade and grade_point are required",
+            400,
+            origin
+          );
+        }
+
+        const gradingId =
+          makeId("grade");
+
+        await env.DB
+          .prepare(
+            `
+            INSERT INTO grading_scales (
+              id,
+              min_marks,
+              max_marks,
+              grade,
+              grade_point,
+              description
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            `
+          )
+          .bind(
+            gradingId,
+            Number(
+              body.min_marks
+            ),
+            Number(
+              body.max_marks
+            ),
+            body.grade,
+            Number(
+              body.grade_point
+            ),
+            body.description ||
+              null
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "grading_scale",
+          gradingId
+        );
+
+        return ok(
+          {
+            message:
+              "Grading scale created",
+            id:
+              gradingId,
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN GRADING SCALE DELETE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/grading-scale\/[^/]+$/
+        ) &&
+        method === "DELETE"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const gradingId =
+          path.split("/")[4];
+
+        await env.DB
+          .prepare(
+            `
+            DELETE FROM grading_scales
+            WHERE id = ?
+            `
+          )
+          .bind(
+            gradingId
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "delete",
+          "grading_scale",
+          gradingId
+        );
+
+        return ok(
+          {
+            message:
+              "Grading scale deleted",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN LOGS
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/logs" &&
+        method === "GET"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const limit =
+          Math.min(
+            Number(
+              url.searchParams.get(
+                "limit"
+              ) || 100
+            ),
+            500
+          );
+
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT
+                l.*,
+                u.name AS admin_name,
+                u.email AS admin_email
+              FROM admin_logs l
+              LEFT JOIN users u
+                ON u.id =
+                  l.admin_user_id
+              ORDER BY
+                l.created_at DESC
+              LIMIT ?
+              `
+            )
+            .bind(limit)
+            .all();
+
+        return ok(
+          {
+            logs:
+              rows.results || [],
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN DASHBOARD STATS
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/dashboard" &&
+        method === "GET"
+      ) {
+        await requireAdmin(
+          request,
+          env
+        );
+
+        const tables = [
+          "users",
+          "teachers",
+          "classes",
+          "subjects",
+          "exams",
+          "marksheets",
+          "notices",
+          "gallery",
+          "events",
+          "documents",
+        ];
+
+        const stats = {};
+
+        for (
+          const table of tables
+        ) {
+          const row =
+            await env.DB
+              .prepare(
+                `SELECT COUNT(*) AS count FROM ${table}`
+              )
+              .first();
+
+          stats[table] =
+            Number(
+              row?.count || 0
+            );
+        }
+
+        return ok(
+          { stats },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ROUTE NOT FOUND
+      =================================================== */
+
+      return error(
+        "Route not found",
+        404,
+        origin
+      );
+
+    } catch (err) {
+      console.error(
+        "Worker error:",
+        err
+      );
+
+      const message =
+        err?.message ||
+        "Internal server error";
+
+      let status = 500;
+
+      if (
+        message.includes(
+          "Authentication required"
+        ) ||
+        message.includes(
+          "Missing Firebase token"
+        ) ||
+        message.includes(
+          "Invalid Firebase token"
+        )
+      ) {
+        status = 401;
+      }
+
+      if (
+        message.includes(
+          "Admin access required"
+        )
+      ) {
+        status = 403;
+      }
+
+      return error(
+        message,
+        status,
+        origin
+      );
+    }
+  },
+};
