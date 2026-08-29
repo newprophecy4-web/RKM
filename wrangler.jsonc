@@ -1,21 +1,21 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
 
-  "name": "madrasa-api",
+  "name": "rkm",
   "main": "src/index.js",
 
   "compatibility_date": "2026-08-29",
 
   "vars": {
-    "FIREBASE_PROJECT_ID": "YOUR_FIREBASE_PROJECT_ID",
-    "CORS_ORIGIN": "https://YOUR-WEBSITE-DOMAIN.com"
+    "FIREBASE_PROJECT_ID": "rkm-2026-969da",
+    "CORS_ORIGIN": "*"
   },
 
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "madrasa-db",
-      "database_id": "YOUR_D1_DATABASE_ID"
+      "database_id": "00b2cdfd-db33-4f6d-baff-a206bb526abd"
     }
   ]
 }
