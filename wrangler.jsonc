@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  "name": "madrasa-api",
+  "main": "src/index.js",
+
+  "compatibility_date": "2026-08-29",
+
+  "vars": {
+    "FIREBASE_PROJECT_ID": "YOUR_FIREBASE_PROJECT_ID",
+    "CORS_ORIGIN": "https://YOUR-WEBSITE-DOMAIN.com"
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "madrasa-db",
+      "database_id": "YOUR_D1_DATABASE_ID"
+    }
+  ]
+}
