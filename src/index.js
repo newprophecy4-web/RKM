@@ -1,20 +1,17 @@
 import { importX509, jwtVerify } from "jose";
 
 /* =========================================================
-   RKM - RAJARHAT KAMIL MADRASHA
-   Cloudflare Worker API
-
-   Firebase Authentication
-        ↓
-   Firebase ID Token
-        ↓
-   Cloudflare Worker
-        ↓
-   Cloudflare D1
+   RAJARHAT KAMIL MADRASHA
+   CLOUDFLARE WORKER API
+   Firebase Authentication + Cloudflare D1 + Optional R2
 ========================================================= */
 
-const json = (data, status = 200, origin = "*") =>
-  new Response(JSON.stringify(data), {
+/* =========================================================
+   RESPONSE HELPERS
+========================================================= */
+
+const json = (data, status = 200, origin = "*") => {
+  return new Response(JSON.stringify(data), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
@@ -25,19 +22,10 @@ const json = (data, status = 200, origin = "*") =>
         "GET, POST, PUT, PATCH, DELETE, OPTIONS",
     },
   });
+};
 
-const error = (message, status = 400, origin = "*") =>
-  json(
-    {
-      success: false,
-      message,
-    },
-    status,
-    origin
-  );
-
-const ok = (data = {}, origin = "*") =>
-  json(
+const ok = (data = {}, origin = "*") => {
+  return json(
     {
       success: true,
       ...data,
@@ -45,17 +33,55 @@ const ok = (data = {}, origin = "*") =>
     200,
     origin
   );
+};
+
+const error = (message, status = 400, origin = "*") => {
+  return json(
+    {
+      success: false,
+      message,
+    },
+    status,
+    origin
+  );
+};
+
+const corsOrigin = (env) => {
+  return env.CORS_ORIGIN || "*";
+};
 
 /* =========================================================
-   CORS
+   ID
 ========================================================= */
 
-function corsOrigin(env) {
-  return env.CORS_ORIGIN || "*";
+function makeId(prefix = "") {
+  const value = crypto.randomUUID().replaceAll("-", "");
+
+  return prefix
+    ? `${prefix}_${value}`
+    : value;
 }
 
 /* =========================================================
-   Firebase Public Key Cache
+   BODY
+========================================================= */
+
+async function getBody(request) {
+  try {
+    const body = await request.json();
+
+    if (!body || typeof body !== "object") {
+      return {};
+    }
+
+    return body;
+  } catch {
+    return {};
+  }
+}
+
+/* =========================================================
+   FIREBASE PUBLIC KEYS
 ========================================================= */
 
 let firebaseKeys = null;
@@ -64,7 +90,10 @@ let firebaseKeysExpires = 0;
 async function getFirebaseKeys() {
   const now = Date.now();
 
-  if (firebaseKeys && now < firebaseKeysExpires) {
+  if (
+    firebaseKeys &&
+    now < firebaseKeysExpires
+  ) {
     return firebaseKeys;
   }
 
@@ -73,13 +102,18 @@ async function getFirebaseKeys() {
   );
 
   if (!response.ok) {
-    throw new Error("Unable to load Firebase public keys");
+    throw new Error(
+      "Unable to load Firebase public keys"
+    );
   }
 
   firebaseKeys = await response.json();
 
-  const cacheControl = response.headers.get("cache-control") || "";
-  const match = cacheControl.match(/max-age=(\d+)/);
+  const cacheControl =
+    response.headers.get("cache-control") || "";
+
+  const match =
+    cacheControl.match(/max-age=(\d+)/);
 
   const maxAge = match
     ? Number(match[1]) * 1000
@@ -91,24 +125,69 @@ async function getFirebaseKeys() {
 }
 
 /* =========================================================
-   Firebase ID Token Verification
+   BASE64URL DECODE
 ========================================================= */
 
-async function verifyFirebaseToken(token, projectId) {
+function decodeBase64Url(value) {
+  let str = value
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+
+  while (str.length % 4) {
+    str += "=";
+  }
+
+  return atob(str);
+}
+
+/* =========================================================
+   FIREBASE TOKEN
+========================================================= */
+
+async function verifyFirebaseToken(
+  token,
+  projectId
+) {
   if (!token) {
     throw new Error("Missing Firebase token");
   }
 
-  const keys = await getFirebaseKeys();
+  if (!projectId) {
+    throw new Error(
+      "FIREBASE_PROJECT_ID is not configured"
+    );
+  }
 
-  const decoded = JSON.parse(
-    atob(token.split(".")[0].replace(/-/g, "+").replace(/_/g, "/"))
-  );
+  const parts = token.split(".");
+
+  if (parts.length !== 3) {
+    throw new Error("Invalid Firebase token");
+  }
+
+  let decoded;
+
+  try {
+    decoded = JSON.parse(
+      decodeBase64Url(parts[0])
+    );
+  } catch {
+    throw new Error("Invalid Firebase token header");
+  }
 
   const kid = decoded.kid;
 
-  if (!kid || !keys[kid]) {
-    throw new Error("Invalid Firebase token key");
+  if (!kid) {
+    throw new Error(
+      "Firebase token key ID missing"
+    );
+  }
+
+  const keys = await getFirebaseKeys();
+
+  if (!keys[kid]) {
+    throw new Error(
+      "Invalid Firebase token key"
+    );
   }
 
   const publicKey = await importX509(
@@ -116,51 +195,63 @@ async function verifyFirebaseToken(token, projectId) {
     "RS256"
   );
 
-  const { payload } = await jwtVerify(token, publicKey, {
-    algorithms: ["RS256"],
-    issuer: `https://securetoken.google.com/${projectId}`,
-    audience: projectId,
-  });
+  const { payload } = await jwtVerify(
+    token,
+    publicKey,
+    {
+      algorithms: ["RS256"],
+      issuer:
+        `https://securetoken.google.com/${projectId}`,
+      audience: projectId,
+    }
+  );
 
-  if (payload.sub !== payload.user_id) {
-    throw new Error("Invalid Firebase user");
+  if (
+    !payload.sub ||
+    payload.sub !== payload.user_id
+  ) {
+    throw new Error(
+      "Invalid Firebase user"
+    );
   }
 
   return payload;
 }
 
 /* =========================================================
-   Authentication Middleware
+   AUTH
 ========================================================= */
 
 async function requireAuth(request, env) {
-  const header = request.headers.get("Authorization");
+  const header =
+    request.headers.get("Authorization");
 
-  if (!header || !header.startsWith("Bearer ")) {
-    throw new Error("Authentication required");
+  if (
+    !header ||
+    !header.startsWith("Bearer ")
+  ) {
+    throw new Error(
+      "Authentication required"
+    );
   }
 
-  const token = header.substring(7).trim();
+  const token =
+    header.substring(7).trim();
 
-  const firebaseUser = await verifyFirebaseToken(
+  return await verifyFirebaseToken(
     token,
     env.FIREBASE_PROJECT_ID
   );
-
-  const uid = firebaseUser.user_id || firebaseUser.sub;
-
-  if (!uid) {
-    throw new Error("Invalid Firebase user");
-  }
-
-  return firebaseUser;
 }
 
 /* =========================================================
-   Get D1 User
+   DB USER
 ========================================================= */
 
-async function getDbUser(env, firebaseUid) {
+async function getDbUser(
+  env,
+  firebaseUid
+) {
   return await env.DB
     .prepare(
       `
@@ -175,27 +266,39 @@ async function getDbUser(env, firebaseUid) {
 }
 
 /* =========================================================
-   Admin Middleware
+   ADMIN
 ========================================================= */
 
-async function requireAdmin(request, env) {
-  const firebaseUser = await requireAuth(request, env);
+async function requireAdmin(
+  request,
+  env
+) {
+  const firebaseUser =
+    await requireAuth(request, env);
 
-  const user = await getDbUser(
-    env,
-    firebaseUser.user_id || firebaseUser.sub
-  );
+  const uid =
+    firebaseUser.user_id ||
+    firebaseUser.sub;
+
+  const user =
+    await getDbUser(env, uid);
 
   if (!user) {
-    throw new Error("User profile not found");
+    throw new Error(
+      "User profile not found"
+    );
   }
 
   if (user.status !== "active") {
-    throw new Error("Account is not active");
+    throw new Error(
+      "Account is not active"
+    );
   }
 
   if (user.role !== "admin") {
-    throw new Error("Admin access required");
+    throw new Error(
+      "Admin access required"
+    );
   }
 
   return {
@@ -205,28 +308,59 @@ async function requireAdmin(request, env) {
 }
 
 /* =========================================================
-   Request Body
+   ADMIN LOG
 ========================================================= */
 
-async function getBody(request) {
+async function adminLog(
+  env,
+  adminId,
+  action,
+  targetType = null,
+  targetId = null,
+  description = null
+) {
   try {
-    return await request.json();
-  } catch {
-    return {};
+    await env.DB
+      .prepare(
+        `
+        INSERT INTO admin_logs (
+          id,
+          admin_user_id,
+          action,
+          target_type,
+          target_id,
+          description
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        `
+      )
+      .bind(
+        makeId("log"),
+        adminId,
+        action,
+        targetType,
+        targetId,
+        description
+      )
+      .run();
+  } catch (err) {
+    console.error(
+      "Admin log error:",
+      err
+    );
   }
 }
 
 /* =========================================================
-   Generate ID
+   INTEGER HELPER
 ========================================================= */
 
-function id(prefix = "") {
-  const value =
-    crypto.randomUUID().replaceAll("-", "");
+function integer(value) {
+  const number = Number(value);
 
-  return prefix
-    ? `${prefix}_${value}`
-    : value;
+  return Number.isInteger(number)
+    ? number
+    : null;
 }
 
 /* =========================================================
@@ -235,15 +369,19 @@ function id(prefix = "") {
 
 export default {
   async fetch(request, env) {
-    const origin = corsOrigin(env);
+    const origin =
+      corsOrigin(env);
 
-    /* ---------- OPTIONS ---------- */
+    /* =====================================================
+       CORS OPTIONS
+    ===================================================== */
 
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
         headers: {
-          "Access-Control-Allow-Origin": origin,
+          "Access-Control-Allow-Origin":
+            origin,
           "Access-Control-Allow-Headers":
             "Content-Type, Authorization",
           "Access-Control-Allow-Methods":
@@ -252,37 +390,52 @@ export default {
       });
     }
 
-    const url = new URL(request.url);
-    const path = url.pathname;
-    const method = request.method;
+    const url =
+      new URL(request.url);
+
+    const path =
+      url.pathname;
+
+    const method =
+      request.method;
 
     try {
-      /* =====================================================
-         ROOT
-      ===================================================== */
 
-      if (path === "/" && method === "GET") {
+      /* ===================================================
+         ROOT
+      =================================================== */
+
+      if (
+        path === "/" &&
+        method === "GET"
+      ) {
         return ok(
           {
-            service: "Rajarhat Kamil Madrasha API",
+            service:
+              "Rajarhat Kamil Madrasha API",
             worker: "online",
             database: true,
-            version: "1.0.0",
+            version: "2.0.0",
           },
           origin
         );
       }
 
-      /* =====================================================
+      /* ===================================================
          HEALTH
-      ===================================================== */
+      =================================================== */
 
-      if (path === "/api/health" && method === "GET") {
+      if (
+        path === "/api/health" &&
+        method === "GET"
+      ) {
         let database = false;
 
         try {
           await env.DB
-            .prepare("SELECT 1 AS ok")
+            .prepare(
+              "SELECT 1 AS ok"
+            )
             .first();
 
           database = true;
@@ -299,481 +452,884 @@ export default {
         );
       }
 
-      /* =====================================================
+      /* ===================================================
          PUBLIC SETTINGS
-      ===================================================== */
+      =================================================== */
 
-      if (path === "/api/settings" && method === "GET") {
-        const rows = await env.DB
-          .prepare(
-            `
-            SELECT key, value
-            FROM settings
-            ORDER BY key
-            `
-          )
-          .all();
+      if (
+        path === "/api/settings" &&
+        method === "GET"
+      ) {
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT
+                key,
+                value,
+                updated_at
+              FROM settings
+              ORDER BY key
+              `
+            )
+            .all();
 
         const settings = {};
 
-        for (const row of rows.results || []) {
-          settings[row.key] = row.value;
+        for (
+          const row of
+          rows.results || []
+        ) {
+          settings[row.key] =
+            row.value;
         }
 
-        return ok({ settings }, origin);
+        return ok(
+          { settings },
+          origin
+        );
       }
 
-      /* =====================================================
+      /* ===================================================
          PUBLIC ACADEMIC YEARS
-      ===================================================== */
+      =================================================== */
 
       if (
         path === "/api/academic-years" &&
         method === "GET"
       ) {
-        const rows = await env.DB
-          .prepare(
-            `
-            SELECT *
-            FROM academic_years
-            ORDER BY year DESC
-            `
-          )
-          .all();
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM academic_years
+              ORDER BY year DESC
+              `
+            )
+            .all();
 
         return ok(
           {
-            academic_years: rows.results || [],
+            academic_years:
+              rows.results || [],
           },
           origin
         );
       }
 
-      /* =====================================================
+      /* ===================================================
          PUBLIC CLASSES
-      ===================================================== */
+      =================================================== */
 
       if (
         path === "/api/classes" &&
         method === "GET"
       ) {
-        const rows = await env.DB
-          .prepare(
-            `
-            SELECT *
-            FROM classes
-            ORDER BY class_number ASC
-            `
-          )
-          .all();
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM classes
+              WHERE status = 'active'
+              ORDER BY class_number ASC
+              `
+            )
+            .all();
 
         return ok(
           {
-            classes: rows.results || [],
+            classes:
+              rows.results || [],
           },
           origin
         );
       }
 
-      /* =====================================================
+      /* ===================================================
          PUBLIC GROUPS
-      ===================================================== */
+      =================================================== */
 
       if (
         path === "/api/groups" &&
         method === "GET"
       ) {
-        const rows = await env.DB
-          .prepare(
-            `
-            SELECT *
-            FROM groups
-            ORDER BY name ASC
-            `
-          )
-          .all();
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM groups
+              WHERE status = 'active'
+              ORDER BY name ASC
+              `
+            )
+            .all();
 
         return ok(
           {
-            groups: rows.results || [],
+            groups:
+              rows.results || [],
           },
           origin
         );
       }
 
-      /* =====================================================
+      /* ===================================================
          PUBLIC SUBJECTS
-      ===================================================== */
+      =================================================== */
 
       if (
         path === "/api/subjects" &&
         method === "GET"
       ) {
-        const rows = await env.DB
-          .prepare(
-            `
-            SELECT *
-            FROM subjects
-            WHERE status = 'active'
-            ORDER BY name ASC
-            `
-          )
-          .all();
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM subjects
+              WHERE status = 'active'
+              ORDER BY name ASC
+              `
+            )
+            .all();
 
         return ok(
           {
-            subjects: rows.results || [],
+            subjects:
+              rows.results || [],
           },
           origin
         );
       }
 
-      /* =====================================================
+      /* ===================================================
+         PUBLIC CLASS SUBJECTS
+      =================================================== */
+
+      if (
+        path === "/api/class-subjects" &&
+        method === "GET"
+      ) {
+        const classId =
+          url.searchParams.get(
+            "class_id"
+          );
+
+        const groupId =
+          url.searchParams.get(
+            "group_id"
+          );
+
+        let sql = `
+          SELECT
+            cs.*,
+            c.name AS class_name,
+            c.name_bn AS class_name_bn,
+            g.name AS group_name,
+            g.name_bn AS group_name_bn,
+            s.name AS subject_name,
+            s.name_bn AS subject_name_bn,
+            s.code AS subject_code
+          FROM class_subjects cs
+          LEFT JOIN classes c
+            ON c.id = cs.class_id
+          LEFT JOIN groups g
+            ON g.id = cs.group_id
+          LEFT JOIN subjects s
+            ON s.id = cs.subject_id
+          WHERE 1 = 1
+        `;
+
+        const params = [];
+
+        if (classId) {
+          sql +=
+            " AND cs.class_id = ?";
+          params.push(classId);
+        }
+
+        if (groupId) {
+          sql +=
+            " AND cs.group_id = ?";
+          params.push(groupId);
+        }
+
+        sql +=
+          " ORDER BY cs.display_order ASC, s.name ASC";
+
+        const rows =
+          await env.DB
+            .prepare(sql)
+            .bind(...params)
+            .all();
+
+        return ok(
+          {
+            class_subjects:
+              rows.results || [],
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
          PUBLIC TEACHERS
-      ===================================================== */
+      =================================================== */
 
       if (
         path === "/api/teachers" &&
         method === "GET"
       ) {
-        const rows = await env.DB
-          .prepare(
-            `
-            SELECT
-              t.id,
-              t.teacher_id,
-              t.name,
-              t.name_bn,
-              t.designation,
-              t.phone,
-              t.email,
-              t.qualification,
-              t.address,
-              t.photo_url,
-              t.joining_date,
-              t.employment_type,
-              t.status,
-              s.name AS subject_name,
-              s.name_bn AS subject_name_bn
-            FROM teachers t
-            LEFT JOIN subjects s
-              ON s.id = t.subject_id
-            WHERE t.status = 'active'
-            ORDER BY t.teacher_id ASC
-            `
-          )
-          .all();
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT
+                t.id,
+                t.teacher_id,
+                t.name,
+                t.name_bn,
+                t.designation,
+                t.phone,
+                t.email,
+                t.qualification,
+                t.address,
+                t.photo_url,
+                t.joining_date,
+                t.employment_type,
+                t.status,
+                t.subject_id,
+                s.name AS subject_name,
+                s.name_bn AS subject_name_bn
+              FROM teachers t
+              LEFT JOIN subjects s
+                ON s.id = t.subject_id
+              WHERE t.status = 'active'
+              ORDER BY t.teacher_id ASC
+              `
+            )
+            .all();
 
         return ok(
           {
-            teachers: rows.results || [],
+            teachers:
+              rows.results || [],
           },
           origin
         );
       }
 
-      /* =====================================================
+      /* ===================================================
          PUBLIC EXAM TYPES
-      ===================================================== */
+      =================================================== */
 
       if (
         path === "/api/exam-types" &&
         method === "GET"
       ) {
-        const rows = await env.DB
-          .prepare(
-            `
-            SELECT *
-            FROM exam_types
-            WHERE status = 'active'
-            ORDER BY name ASC
-            `
-          )
-          .all();
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM exam_types
+              WHERE status = 'active'
+              ORDER BY name ASC
+              `
+            )
+            .all();
 
         return ok(
           {
-            exam_types: rows.results || [],
+            exam_types:
+              rows.results || [],
           },
           origin
         );
       }
 
-      /* =====================================================
+      /* ===================================================
+         PUBLIC EXAMS
+      =================================================== */
+
+      if (
+        path === "/api/exams" &&
+        method === "GET"
+      ) {
+        const yearId =
+          url.searchParams.get(
+            "academic_year_id"
+          );
+
+        const classId =
+          url.searchParams.get(
+            "class_id"
+          );
+
+        const groupId =
+          url.searchParams.get(
+            "group_id"
+          );
+
+        let sql = `
+          SELECT
+            e.*,
+            et.name AS exam_type_name,
+            et.name_bn AS exam_type_name_bn,
+            ay.year,
+            c.name AS class_name,
+            c.name_bn AS class_name_bn,
+            g.name AS group_name,
+            g.name_bn AS group_name_bn
+          FROM exams e
+          LEFT JOIN exam_types et
+            ON et.id = e.exam_type_id
+          LEFT JOIN academic_years ay
+            ON ay.id = e.academic_year_id
+          LEFT JOIN classes c
+            ON c.id = e.class_id
+          LEFT JOIN groups g
+            ON g.id = e.group_id
+          WHERE e.published = 1
+        `;
+
+        const params = [];
+
+        if (yearId) {
+          sql +=
+            " AND e.academic_year_id = ?";
+          params.push(yearId);
+        }
+
+        if (classId) {
+          sql +=
+            " AND e.class_id = ?";
+          params.push(classId);
+        }
+
+        if (groupId) {
+          sql +=
+            " AND e.group_id = ?";
+          params.push(groupId);
+        }
+
+        sql +=
+          " ORDER BY e.start_date DESC, e.created_at DESC";
+
+        const rows =
+          await env.DB
+            .prepare(sql)
+            .bind(...params)
+            .all();
+
+        return ok(
+          {
+            exams:
+              rows.results || [],
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         PUBLIC EXAM SUBJECTS
+      =================================================== */
+
+      if (
+        path === "/api/exam-subjects" &&
+        method === "GET"
+      ) {
+        const examId =
+          url.searchParams.get(
+            "exam_id"
+          );
+
+        let sql = `
+          SELECT
+            es.*,
+            s.name AS subject_name,
+            s.name_bn AS subject_name_bn,
+            s.code AS subject_code
+          FROM exam_subjects es
+          LEFT JOIN subjects s
+            ON s.id = es.subject_id
+          WHERE 1 = 1
+        `;
+
+        const params = [];
+
+        if (examId) {
+          sql +=
+            " AND es.exam_id = ?";
+          params.push(examId);
+        }
+
+        sql +=
+          " ORDER BY es.display_order ASC";
+
+        const rows =
+          await env.DB
+            .prepare(sql)
+            .bind(...params)
+            .all();
+
+        return ok(
+          {
+            exam_subjects:
+              rows.results || [],
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
          PUBLIC NOTICES
-      ===================================================== */
+      =================================================== */
 
       if (
         path === "/api/notices" &&
         method === "GET"
       ) {
-        const rows = await env.DB
-          .prepare(
-            `
-            SELECT
-              id,
-              title,
-              title_bn,
-              content,
-              content_bn,
-              category,
-              attachment_url,
-              publish_at,
-              expires_at,
-              created_at
-            FROM notices
-            WHERE published = 1
-              AND (
-                publish_at IS NULL
-                OR publish_at <= CURRENT_TIMESTAMP
-              )
-              AND (
-                expires_at IS NULL
-                OR expires_at > CURRENT_TIMESTAMP
-              )
-            ORDER BY
-              COALESCE(publish_at, created_at) DESC
-            `
-          )
-          .all();
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT
+                id,
+                title,
+                title_bn,
+                content,
+                content_bn,
+                category,
+                attachment_url,
+                published,
+                publish_at,
+                expires_at,
+                created_at,
+                updated_at
+              FROM notices
+              WHERE published = 1
+                AND (
+                  publish_at IS NULL
+                  OR publish_at <= CURRENT_TIMESTAMP
+                )
+                AND (
+                  expires_at IS NULL
+                  OR expires_at > CURRENT_TIMESTAMP
+                )
+              ORDER BY
+                COALESCE(
+                  publish_at,
+                  created_at
+                ) DESC
+              `
+            )
+            .all();
 
         return ok(
           {
-            notices: rows.results || [],
+            notices:
+              rows.results || [],
           },
           origin
         );
       }
 
-      /* =====================================================
+      /* ===================================================
          PUBLIC HERO ADS
-      ===================================================== */
+      =================================================== */
 
       if (
         path === "/api/hero-ads" &&
         method === "GET"
       ) {
-        const rows = await env.DB
-          .prepare(
-            `
-            SELECT *
-            FROM hero_ads
-            WHERE status = 'active'
-              AND (
-                start_at IS NULL
-                OR start_at <= CURRENT_TIMESTAMP
-              )
-              AND (
-                end_at IS NULL
-                OR end_at > CURRENT_TIMESTAMP
-              )
-            ORDER BY display_order ASC
-            `
-          )
-          .all();
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM hero_ads
+              WHERE status = 'active'
+                AND (
+                  start_at IS NULL
+                  OR start_at <= CURRENT_TIMESTAMP
+                )
+                AND (
+                  end_at IS NULL
+                  OR end_at > CURRENT_TIMESTAMP
+                )
+              ORDER BY display_order ASC
+              `
+            )
+            .all();
 
         return ok(
           {
-            hero_ads: rows.results || [],
+            hero_ads:
+              rows.results || [],
           },
           origin
         );
       }
 
-      /* =====================================================
+      /* ===================================================
          PUBLIC EVENTS
-      ===================================================== */
+      =================================================== */
 
       if (
         path === "/api/events" &&
         method === "GET"
       ) {
-        const rows = await env.DB
-          .prepare(
-            `
-            SELECT *
-            FROM events
-            WHERE status = 'active'
-            ORDER BY start_datetime ASC
-            `
-          )
-          .all();
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM events
+              WHERE status = 'active'
+              ORDER BY start_datetime ASC
+              `
+            )
+            .all();
 
         return ok(
           {
-            events: rows.results || [],
+            events:
+              rows.results || [],
           },
           origin
         );
       }
 
-      /* =====================================================
+      /* ===================================================
          PUBLIC GALLERY
-      ===================================================== */
+      =================================================== */
 
       if (
         path === "/api/gallery" &&
         method === "GET"
       ) {
-        const rows = await env.DB
-          .prepare(
-            `
-            SELECT
-              id,
-              title,
-              description,
-              image_url,
-              category,
-              display_order,
-              created_at
-            FROM gallery
-            WHERE published = 1
-            ORDER BY display_order ASC, created_at DESC
-            `
-          )
-          .all();
+        const category =
+          url.searchParams.get(
+            "category"
+          );
+
+        let sql = `
+          SELECT
+            id,
+            title,
+            description,
+            image_url,
+            category,
+            display_order,
+            published,
+            created_at
+          FROM gallery
+          WHERE published = 1
+        `;
+
+        const params = [];
+
+        if (category) {
+          sql +=
+            " AND category = ?";
+          params.push(category);
+        }
+
+        sql +=
+          " ORDER BY display_order ASC, created_at DESC";
+
+        const rows =
+          await env.DB
+            .prepare(sql)
+            .bind(...params)
+            .all();
 
         return ok(
           {
-            gallery: rows.results || [],
+            gallery:
+              rows.results || [],
           },
           origin
         );
       }
 
-      /* =====================================================
+      /* ===================================================
          PUBLIC DOCUMENTS
-      ===================================================== */
+      =================================================== */
 
       if (
         path === "/api/documents" &&
         method === "GET"
       ) {
-        const rows = await env.DB
-          .prepare(
-            `
-            SELECT
-              id,
-              title,
-              description,
-              file_name,
-              mime_type,
-              file_size,
-              category,
-              created_at
-            FROM documents
-            WHERE visibility = 'public'
-            ORDER BY created_at DESC
-            `
-          )
-          .all();
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT
+                id,
+                title,
+                description,
+                file_name,
+                r2_key,
+                mime_type,
+                file_size,
+                category,
+                visibility,
+                created_at
+              FROM documents
+              WHERE visibility = 'public'
+              ORDER BY created_at DESC
+              `
+            )
+            .all();
 
         return ok(
           {
-            documents: rows.results || [],
+            documents:
+              rows.results || [],
           },
           origin
         );
       }
 
-      /* =====================================================
-         PUBLIC RESULTS SEARCH
-      ===================================================== */
+      /* ===================================================
+         PUBLIC GRADING SCALE
+      =================================================== */
+
+      if (
+        path === "/api/grading-scale" &&
+        method === "GET"
+      ) {
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM grading_scales
+              ORDER BY min_marks DESC
+              `
+            )
+            .all();
+
+        return ok(
+          {
+            grading_scale:
+              rows.results || [],
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         PUBLIC RESULTS
+      =================================================== */
 
       if (
         path === "/api/results" &&
         method === "GET"
       ) {
         const examId =
-          url.searchParams.get("exam_id");
+          url.searchParams.get(
+            "exam_id"
+          );
 
         const classId =
-          url.searchParams.get("class_id");
+          url.searchParams.get(
+            "class_id"
+          );
+
+        const yearId =
+          url.searchParams.get(
+            "academic_year_id"
+          );
 
         const roll =
-          url.searchParams.get("roll");
+          url.searchParams.get(
+            "roll"
+          );
 
         const name =
-          url.searchParams.get("name");
+          url.searchParams.get(
+            "name"
+          );
+
+        const marksheetId =
+          url.searchParams.get(
+            "id"
+          );
 
         let sql = `
           SELECT
             m.*,
+
             e.name AS exam_name,
             e.name_bn AS exam_name_bn,
+
+            et.name AS exam_type_name,
+            et.name_bn AS exam_type_name_bn,
+
+            ay.year,
+
             c.name AS class_name,
             c.name_bn AS class_name_bn,
+
             g.name AS group_name,
             g.name_bn AS group_name_bn
+
           FROM marksheets m
+
           LEFT JOIN exams e
             ON e.id = m.exam_id
+
+          LEFT JOIN exam_types et
+            ON et.id = e.exam_type_id
+
+          LEFT JOIN academic_years ay
+            ON ay.id = m.academic_year_id
+
           LEFT JOIN classes c
             ON c.id = m.class_id
+
           LEFT JOIN groups g
             ON g.id = m.group_id
+
           WHERE m.published = 1
         `;
 
         const params = [];
 
+        if (marksheetId) {
+          sql +=
+            " AND m.id = ?";
+          params.push(marksheetId);
+        }
+
         if (examId) {
-          sql += ` AND m.exam_id = ?`;
+          sql +=
+            " AND m.exam_id = ?";
           params.push(examId);
         }
 
         if (classId) {
-          sql += ` AND m.class_id = ?`;
+          sql +=
+            " AND m.class_id = ?";
           params.push(classId);
         }
 
+        if (yearId) {
+          sql +=
+            " AND m.academic_year_id = ?";
+          params.push(yearId);
+        }
+
         if (roll) {
-          sql += ` AND m.roll_number = ?`;
-          params.push(Number(roll));
+          const rollNumber =
+            integer(roll);
+
+          if (rollNumber !== null) {
+            sql +=
+              " AND m.roll_number = ?";
+            params.push(rollNumber);
+          }
         }
 
         if (name) {
-          sql += ` AND m.student_name LIKE ?`;
-          params.push(`%${name}%`);
+          sql +=
+            " AND m.student_name LIKE ?";
+          params.push(
+            `%${name}%`
+          );
         }
 
         sql += `
           ORDER BY
-            m.rank ASC,
+            CASE
+              WHEN m.rank IS NULL THEN 999999
+              ELSE m.rank
+            END ASC,
             m.roll_number ASC
           LIMIT 100
         `;
 
-        const rows = await env.DB
-          .prepare(sql)
-          .bind(...params)
-          .all();
+        const rows =
+          await env.DB
+            .prepare(sql)
+            .bind(...params)
+            .all();
+
+        const results =
+          rows.results || [];
+
+        /* Get subject marks */
+        for (
+          const result of results
+        ) {
+          const subjects =
+            await env.DB
+              .prepare(
+                `
+                SELECT *
+                FROM marksheet_subjects
+                WHERE marksheet_id = ?
+                ORDER BY display_order ASC
+                `
+              )
+              .bind(result.id)
+              .all();
+
+          result.subjects =
+            subjects.results || [];
+
+          const rank =
+            await env.DB
+              .prepare(
+                `
+                SELECT *
+                FROM marksheet_ranks
+                WHERE marksheet_id = ?
+                LIMIT 1
+                `
+              )
+              .bind(result.id)
+              .first();
+
+          result.manual_rank =
+            rank || null;
+        }
 
         return ok(
-          {
-            results: rows.results || [],
-          },
+          { results },
           origin
         );
       }
 
-      /* =====================================================
-         AUTH - ME
-      ===================================================== */
+      /* ===================================================
+         AUTH ME
+      =================================================== */
 
       if (
         path === "/api/me" &&
         method === "GET"
       ) {
         const firebaseUser =
-          await requireAuth(request, env);
+          await requireAuth(
+            request,
+            env
+          );
 
         const uid =
           firebaseUser.user_id ||
           firebaseUser.sub;
 
         const user =
-          await getDbUser(env, uid);
+          await getDbUser(
+            env,
+            uid
+          );
 
         if (!user) {
           return error(
@@ -791,27 +1347,31 @@ export default {
         );
       }
 
-      /* =====================================================
-         AUTH - SYNC USER
-         Firebase user → D1 users
-      ===================================================== */
+      /* ===================================================
+         AUTH SYNC
+      =================================================== */
 
       if (
         path === "/api/auth/sync" &&
         method === "POST"
       ) {
         const firebaseUser =
-          await requireAuth(request, env);
+          await requireAuth(
+            request,
+            env
+          );
 
         const uid =
           firebaseUser.user_id ||
           firebaseUser.sub;
 
-        const body = await getBody(request);
+        const body =
+          await getBody(request);
 
         const firebaseName =
           firebaseUser.name ||
-          firebaseUser.firebase?.display_name ||
+          firebaseUser.firebase
+            ?.display_name ||
           body.name ||
           "User";
 
@@ -821,7 +1381,10 @@ export default {
           null;
 
         const existing =
-          await getDbUser(env, uid);
+          await getDbUser(
+            env,
+            uid
+          );
 
         if (existing) {
           await env.DB
@@ -831,8 +1394,10 @@ export default {
               SET
                 name = ?,
                 email = ?,
-                last_login_at = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP
+                last_login_at =
+                  CURRENT_TIMESTAMP,
+                updated_at =
+                  CURRENT_TIMESTAMP
               WHERE firebase_uid = ?
               `
             )
@@ -844,18 +1409,23 @@ export default {
             .run();
 
           const user =
-            await getDbUser(env, uid);
+            await getDbUser(
+              env,
+              uid
+            );
 
           return ok(
             {
-              message: "User login synced",
+              message:
+                "User login synced",
               user,
             },
             origin
           );
         }
 
-        const userId = id("user");
+        const userId =
+          makeId("user");
 
         await env.DB
           .prepare(
@@ -871,7 +1441,12 @@ export default {
               status,
               last_login_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'user', 'active', CURRENT_TIMESTAMP)
+            VALUES (
+              ?, ?, ?, ?, ?, ?,
+              'user',
+              'active',
+              CURRENT_TIMESTAMP
+            )
             `
           )
           .bind(
@@ -885,34 +1460,44 @@ export default {
           .run();
 
         const user =
-          await getDbUser(env, uid);
+          await getDbUser(
+            env,
+            uid
+          );
 
         return ok(
           {
-            message: "User profile created",
+            message:
+              "User profile created",
             user,
           },
           origin
         );
       }
 
-      /* =====================================================
-         AUTH USER NOTIFICATIONS
-      ===================================================== */
+      /* ===================================================
+         AUTH NOTIFICATIONS
+      =================================================== */
 
       if (
         path === "/api/notifications" &&
         method === "GET"
       ) {
         const firebaseUser =
-          await requireAuth(request, env);
+          await requireAuth(
+            request,
+            env
+          );
 
         const uid =
           firebaseUser.user_id ||
           firebaseUser.sub;
 
         const user =
-          await getDbUser(env, uid);
+          await getDbUser(
+            env,
+            uid
+          );
 
         if (!user) {
           return error(
@@ -922,30 +1507,32 @@ export default {
           );
         }
 
-        const rows = await env.DB
-          .prepare(
-            `
-            SELECT *
-            FROM notifications
-            WHERE user_id = ?
-            ORDER BY created_at DESC
-            LIMIT 100
-            `
-          )
-          .bind(user.id)
-          .all();
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM notifications
+              WHERE user_id = ?
+              ORDER BY created_at DESC
+              LIMIT 100
+              `
+            )
+            .bind(user.id)
+            .all();
 
         return ok(
           {
-            notifications: rows.results || [],
+            notifications:
+              rows.results || [],
           },
           origin
         );
       }
 
-      /* =====================================================
+      /* ===================================================
          MARK NOTIFICATION READ
-      ===================================================== */
+      =================================================== */
 
       if (
         path.match(
@@ -954,14 +1541,20 @@ export default {
         method === "PATCH"
       ) {
         const firebaseUser =
-          await requireAuth(request, env);
+          await requireAuth(
+            request,
+            env
+          );
 
         const uid =
           firebaseUser.user_id ||
           firebaseUser.sub;
 
         const user =
-          await getDbUser(env, uid);
+          await getDbUser(
+            env,
+            uid
+          );
 
         if (!user) {
           return error(
@@ -991,70 +1584,86 @@ export default {
 
         return ok(
           {
-            message: "Notification marked as read",
+            message:
+              "Notification marked as read",
           },
           origin
         );
       }
 
-      /* =====================================================
-         ADMIN - USERS
-      ===================================================== */
+      /* ===================================================
+         ADMIN USERS
+      =================================================== */
 
       if (
         path === "/api/admin/users" &&
         method === "GET"
       ) {
-        await requireAdmin(request, env);
+        await requireAdmin(
+          request,
+          env
+        );
 
-        const rows = await env.DB
-          .prepare(
-            `
-            SELECT
-              id,
-              firebase_uid,
-              name,
-              email,
-              phone,
-              photo_url,
-              role,
-              status,
-              created_at,
-              updated_at,
-              last_login_at
-            FROM users
-            ORDER BY created_at DESC
-            `
-          )
-          .all();
+        const rows =
+          await env.DB
+            .prepare(
+              `
+              SELECT
+                id,
+                firebase_uid,
+                name,
+                email,
+                phone,
+                photo_url,
+                role,
+                status,
+                created_at,
+                updated_at,
+                last_login_at
+              FROM users
+              ORDER BY created_at DESC
+              `
+            )
+            .all();
 
         return ok(
           {
-            users: rows.results || [],
+            users:
+              rows.results || [],
           },
           origin
         );
       }
 
-      /* =====================================================
-         ADMIN - CHANGE USER ROLE
-      ===================================================== */
+      /* ===================================================
+         ADMIN USER ROLE
+      =================================================== */
 
       if (
-        path.match(/^\/api\/admin\/users\/[^/]+\/role$/) &&
+        path.match(
+          /^\/api\/admin\/users\/[^/]+\/role$/
+        ) &&
         method === "PATCH"
       ) {
         const admin =
-          await requireAdmin(request, env);
+          await requireAdmin(
+            request,
+            env
+          );
 
         const targetId =
           path.split("/")[4];
 
-        const body = await getBody(request);
+        const body =
+          await getBody(request);
 
-        const role = body.role;
+        const role =
+          body.role;
 
-        if (!["admin", "user"].includes(role)) {
+        if (
+          !["admin", "user"]
+            .includes(role)
+        ) {
           return error(
             "Invalid role",
             400,
@@ -1062,7 +1671,9 @@ export default {
           );
         }
 
-        if (admin.user.id === targetId) {
+        if (
+          admin.user.id === targetId
+        ) {
           return error(
             "You cannot change your own role",
             400,
@@ -1076,42 +1687,66 @@ export default {
             UPDATE users
             SET
               role = ?,
-              updated_at = CURRENT_TIMESTAMP
+              updated_at =
+                CURRENT_TIMESTAMP
             WHERE id = ?
             `
           )
-          .bind(role, targetId)
+          .bind(
+            role,
+            targetId
+          )
           .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "change_user_role",
+          "user",
+          targetId,
+          `Role changed to ${role}`
+        );
 
         return ok(
           {
-            message: "User role updated",
+            message:
+              "User role updated",
           },
           origin
         );
       }
 
-      /* =====================================================
-         ADMIN - CHANGE USER STATUS
-      ===================================================== */
+      /* ===================================================
+         ADMIN USER STATUS
+      =================================================== */
 
       if (
-        path.match(/^\/api\/admin\/users\/[^/]+\/status$/) &&
+        path.match(
+          /^\/api\/admin\/users\/[^/]+\/status$/
+        ) &&
         method === "PATCH"
       ) {
         const admin =
-          await requireAdmin(request, env);
+          await requireAdmin(
+            request,
+            env
+          );
 
         const targetId =
           path.split("/")[4];
 
-        const body = await getBody(request);
+        const body =
+          await getBody(request);
 
-        const status = body.status;
+        const status =
+          body.status;
 
         if (
-          !["active", "inactive", "suspended"]
-            .includes(status)
+          ![
+            "active",
+            "inactive",
+            "suspended",
+          ].includes(status)
         ) {
           return error(
             "Invalid status",
@@ -1120,7 +1755,9 @@ export default {
           );
         }
 
-        if (admin.user.id === targetId) {
+        if (
+          admin.user.id === targetId
+        ) {
           return error(
             "You cannot change your own status",
             400,
@@ -1134,45 +1771,58 @@ export default {
             UPDATE users
             SET
               status = ?,
-              updated_at = CURRENT_TIMESTAMP
+              updated_at =
+                CURRENT_TIMESTAMP
             WHERE id = ?
             `
           )
-          .bind(status, targetId)
+          .bind(
+            status,
+            targetId
+          )
           .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "change_user_status",
+          "user",
+          targetId,
+          `Status changed to ${status}`
+        );
 
         return ok(
           {
-            message: "User status updated",
+            message:
+              "User status updated",
           },
           origin
         );
       }
 
-      /* =====================================================
-         ADMIN - SETTINGS UPDATE
-      ===================================================== */
+      /* ===================================================
+         ADMIN SETTINGS
+      =================================================== */
 
       if (
         path === "/api/admin/settings" &&
         method === "PUT"
       ) {
         const admin =
-          await requireAdmin(request, env);
-
-        const body = await getBody(request);
-
-        if (!body || typeof body !== "object") {
-          return error(
-            "Invalid settings data",
-            400,
-            origin
+          await requireAdmin(
+            request,
+            env
           );
-        }
+
+        const body =
+          await getBody(request);
 
         const statements = [];
 
-        for (const [key, value] of Object.entries(body)) {
+        for (
+          const [key, value]
+          of Object.entries(body)
+        ) {
           statements.push(
             env.DB
               .prepare(
@@ -1183,12 +1833,18 @@ export default {
                   updated_by,
                   updated_at
                 )
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (
+                  ?, ?, ?,
+                  CURRENT_TIMESTAMP
+                )
                 ON CONFLICT(key)
                 DO UPDATE SET
-                  value = excluded.value,
-                  updated_by = excluded.updated_by,
-                  updated_at = CURRENT_TIMESTAMP
+                  value =
+                    excluded.value,
+                  updated_by =
+                    excluded.updated_by,
+                  updated_at =
+                    CURRENT_TIMESTAMP
                 `
               )
               .bind(
@@ -1201,32 +1857,53 @@ export default {
           );
         }
 
-        if (statements.length > 0) {
-          await env.DB.batch(statements);
+        if (
+          statements.length
+        ) {
+          await env.DB.batch(
+            statements
+          );
         }
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "update_settings",
+          "settings",
+          null,
+          "Website settings updated"
+        );
 
         return ok(
           {
-            message: "Settings updated",
+            message:
+              "Settings updated",
           },
           origin
         );
       }
 
-      /* =====================================================
-         ADMIN - CREATE NOTICE
-      ===================================================== */
+      /* ===================================================
+         ADMIN CREATE NOTICE
+      =================================================== */
 
       if (
         path === "/api/admin/notices" &&
         method === "POST"
       ) {
         const admin =
-          await requireAdmin(request, env);
+          await requireAdmin(
+            request,
+            env
+          );
 
-        const body = await getBody(request);
+        const body =
+          await getBody(request);
 
-        if (!body.title || !body.content) {
+        if (
+          !body.title ||
+          !body.content
+        ) {
           return error(
             "Title and content are required",
             400,
@@ -1234,7 +1911,8 @@ export default {
           );
         }
 
-        const noticeId = id("notice");
+        const noticeId =
+          makeId("notice");
 
         await env.DB
           .prepare(
@@ -1252,7 +1930,10 @@ export default {
               expires_at,
               created_by
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (
+              ?, ?, ?, ?, ?, ?,
+              ?, ?, ?, ?, ?
+            )
             `
           )
           .bind(
@@ -1261,36 +1942,204 @@ export default {
             body.title_bn || null,
             body.content,
             body.content_bn || null,
-            body.category || "general",
-            body.attachment_url || null,
-            body.published ? 1 : 0,
+            body.category ||
+              "general",
+            body.attachment_url ||
+              null,
+            body.published
+              ? 1
+              : 0,
             body.publish_at || null,
             body.expires_at || null,
             admin.user.id
           )
           .run();
 
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "notice",
+          noticeId,
+          body.title
+        );
+
         return ok(
           {
-            message: "Notice created",
+            message:
+              "Notice created",
             id: noticeId,
           },
           origin
         );
       }
 
-      /* =====================================================
-         ADMIN - CREATE HERO AD
-      ===================================================== */
+      /* ===================================================
+         ADMIN UPDATE NOTICE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/notices\/[^/]+$/
+        ) &&
+        method === "PATCH"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const noticeId =
+          path.split("/")[4];
+
+        const body =
+          await getBody(request);
+
+        const existing =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM notices
+              WHERE id = ?
+              `
+            )
+            .bind(noticeId)
+            .first();
+
+        if (!existing) {
+          return error(
+            "Notice not found",
+            404,
+            origin
+          );
+        }
+
+        await env.DB
+          .prepare(
+            `
+            UPDATE notices
+            SET
+              title = ?,
+              title_bn = ?,
+              content = ?,
+              content_bn = ?,
+              category = ?,
+              attachment_url = ?,
+              published = ?,
+              publish_at = ?,
+              expires_at = ?,
+              updated_at =
+                CURRENT_TIMESTAMP
+            WHERE id = ?
+            `
+          )
+          .bind(
+            body.title ??
+              existing.title,
+            body.title_bn ??
+              existing.title_bn,
+            body.content ??
+              existing.content,
+            body.content_bn ??
+              existing.content_bn,
+            body.category ??
+              existing.category,
+            body.attachment_url ??
+              existing.attachment_url,
+            body.published == null
+              ? existing.published
+              : body.published
+                ? 1
+                : 0,
+            body.publish_at ??
+              existing.publish_at,
+            body.expires_at ??
+              existing.expires_at,
+            noticeId
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "update",
+          "notice",
+          noticeId
+        );
+
+        return ok(
+          {
+            message:
+              "Notice updated",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN DELETE NOTICE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/notices\/[^/]+$/
+        ) &&
+        method === "DELETE"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const noticeId =
+          path.split("/")[4];
+
+        await env.DB
+          .prepare(
+            `
+            DELETE FROM notices
+            WHERE id = ?
+            `
+          )
+          .bind(noticeId)
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "delete",
+          "notice",
+          noticeId
+        );
+
+        return ok(
+          {
+            message:
+              "Notice deleted",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN HERO AD
+      =================================================== */
 
       if (
         path === "/api/admin/hero-ads" &&
         method === "POST"
       ) {
         const admin =
-          await requireAdmin(request, env);
+          await requireAdmin(
+            request,
+            env
+          );
 
-        const body = await getBody(request);
+        const body =
+          await getBody(request);
 
         if (!body.title) {
           return error(
@@ -1300,7 +2149,8 @@ export default {
           );
         }
 
-        const heroId = id("hero");
+        const heroId =
+          makeId("hero");
 
         await env.DB
           .prepare(
@@ -1318,7 +2168,10 @@ export default {
               end_at,
               created_by
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (
+              ?, ?, ?, ?, ?, ?,
+              ?, ?, ?, ?, ?
+            )
             `
           )
           .bind(
@@ -1328,35 +2181,203 @@ export default {
             body.image_url || null,
             body.button_text || null,
             body.button_url || null,
-            Number(body.display_order || 0),
-            body.status || "inactive",
+            Number(
+              body.display_order || 0
+            ),
+            body.status ||
+              "inactive",
             body.start_at || null,
             body.end_at || null,
             admin.user.id
           )
           .run();
 
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "hero_ad",
+          heroId,
+          body.title
+        );
+
         return ok(
           {
-            message: "Hero ad created",
+            message:
+              "Hero ad created",
             id: heroId,
           },
           origin
         );
       }
 
-      /* =====================================================
-         ADMIN - CREATE GALLERY ITEM
-      ===================================================== */
+      /* ===================================================
+         ADMIN UPDATE HERO AD
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/hero-ads\/[^/]+$/
+        ) &&
+        method === "PATCH"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const heroId =
+          path.split("/")[4];
+
+        const body =
+          await getBody(request);
+
+        const existing =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM hero_ads
+              WHERE id = ?
+              `
+            )
+            .bind(heroId)
+            .first();
+
+        if (!existing) {
+          return error(
+            "Hero ad not found",
+            404,
+            origin
+          );
+        }
+
+        await env.DB
+          .prepare(
+            `
+            UPDATE hero_ads
+            SET
+              title = ?,
+              description = ?,
+              image_url = ?,
+              button_text = ?,
+              button_url = ?,
+              display_order = ?,
+              status = ?,
+              start_at = ?,
+              end_at = ?,
+              updated_at =
+                CURRENT_TIMESTAMP
+            WHERE id = ?
+            `
+          )
+          .bind(
+            body.title ??
+              existing.title,
+            body.description ??
+              existing.description,
+            body.image_url ??
+              existing.image_url,
+            body.button_text ??
+              existing.button_text,
+            body.button_url ??
+              existing.button_url,
+            body.display_order ==
+              null
+              ? existing.display_order
+              : Number(
+                  body.display_order
+                ),
+            body.status ??
+              existing.status,
+            body.start_at ??
+              existing.start_at,
+            body.end_at ??
+              existing.end_at,
+            heroId
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "update",
+          "hero_ad",
+          heroId
+        );
+
+        return ok(
+          {
+            message:
+              "Hero ad updated",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN DELETE HERO
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/hero-ads\/[^/]+$/
+        ) &&
+        method === "DELETE"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const heroId =
+          path.split("/")[4];
+
+        await env.DB
+          .prepare(
+            `
+            DELETE FROM hero_ads
+            WHERE id = ?
+            `
+          )
+          .bind(heroId)
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "delete",
+          "hero_ad",
+          heroId
+        );
+
+        return ok(
+          {
+            message:
+              "Hero ad deleted",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN GALLERY
+      =================================================== */
 
       if (
         path === "/api/admin/gallery" &&
         method === "POST"
       ) {
         const admin =
-          await requireAdmin(request, env);
+          await requireAdmin(
+            request,
+            env
+          );
 
-        const body = await getBody(request);
+        const body =
+          await getBody(request);
 
         if (!body.image_url) {
           return error(
@@ -1366,7 +2387,8 @@ export default {
           );
         }
 
-        const galleryId = id("gallery");
+        const galleryId =
+          makeId("gallery");
 
         await env.DB
           .prepare(
@@ -1381,7 +2403,9 @@ export default {
               published,
               uploaded_by
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?
+            )
             `
           )
           .bind(
@@ -1389,34 +2413,195 @@ export default {
             body.title || null,
             body.description || null,
             body.image_url,
-            body.category || "general",
-            Number(body.display_order || 0),
-            body.published === false ? 0 : 1,
+            body.category ||
+              "general",
+            Number(
+              body.display_order || 0
+            ),
+            body.published === false
+              ? 0
+              : 1,
             admin.user.id
           )
           .run();
 
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "gallery",
+          galleryId
+        );
+
         return ok(
           {
-            message: "Gallery item created",
+            message:
+              "Gallery item created",
             id: galleryId,
           },
           origin
         );
       }
 
-      /* =====================================================
-         ADMIN - CREATE TEACHER
-      ===================================================== */
+      /* ===================================================
+         ADMIN UPDATE GALLERY
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/gallery\/[^/]+$/
+        ) &&
+        method === "PATCH"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const galleryId =
+          path.split("/")[4];
+
+        const body =
+          await getBody(request);
+
+        const existing =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM gallery
+              WHERE id = ?
+              `
+            )
+            .bind(galleryId)
+            .first();
+
+        if (!existing) {
+          return error(
+            "Gallery item not found",
+            404,
+            origin
+          );
+        }
+
+        await env.DB
+          .prepare(
+            `
+            UPDATE gallery
+            SET
+              title = ?,
+              description = ?,
+              image_url = ?,
+              category = ?,
+              display_order = ?,
+              published = ?
+            WHERE id = ?
+            `
+          )
+          .bind(
+            body.title ??
+              existing.title,
+            body.description ??
+              existing.description,
+            body.image_url ??
+              existing.image_url,
+            body.category ??
+              existing.category,
+            body.display_order ==
+              null
+              ? existing.display_order
+              : Number(
+                  body.display_order
+                ),
+            body.published == null
+              ? existing.published
+              : body.published
+                ? 1
+                : 0,
+            galleryId
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "update",
+          "gallery",
+          galleryId
+        );
+
+        return ok(
+          {
+            message:
+              "Gallery item updated",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN DELETE GALLERY
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/gallery\/[^/]+$/
+        ) &&
+        method === "DELETE"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const galleryId =
+          path.split("/")[4];
+
+        await env.DB
+          .prepare(
+            `
+            DELETE FROM gallery
+            WHERE id = ?
+            `
+          )
+          .bind(galleryId)
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "delete",
+          "gallery",
+          galleryId
+        );
+
+        return ok(
+          {
+            message:
+              "Gallery item deleted",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN TEACHER CREATE
+      =================================================== */
 
       if (
         path === "/api/admin/teachers" &&
         method === "POST"
       ) {
         const admin =
-          await requireAdmin(request, env);
+          await requireAdmin(
+            request,
+            env
+          );
 
-        const body = await getBody(request);
+        const body =
+          await getBody(request);
 
         if (!body.name) {
           return error(
@@ -1426,7 +2611,8 @@ export default {
           );
         }
 
-        let teacherId = body.teacher_id;
+        let teacherId =
+          body.teacher_id;
 
         if (!teacherId) {
           const result =
@@ -1436,7 +2622,13 @@ export default {
                 SELECT teacher_id
                 FROM teachers
                 WHERE teacher_id LIKE 'RKM-%'
-                ORDER BY teacher_id DESC
+                ORDER BY
+                  CAST(
+                    SUBSTR(
+                      teacher_id,
+                      5
+                    ) AS INTEGER
+                  ) DESC
                 LIMIT 1
                 `
               )
@@ -1444,21 +2636,30 @@ export default {
 
           let nextNumber = 1;
 
-          if (result?.teacher_id) {
+          if (
+            result?.teacher_id
+          ) {
             const match =
-              result.teacher_id.match(/RKM-(\d+)/);
+              result.teacher_id.match(
+                /^RKM-(\d+)$/
+              );
 
             if (match) {
               nextNumber =
-                Number(match[1]) + 1;
+                Number(
+                  match[1]
+                ) + 1;
             }
           }
 
           teacherId =
-            `RKM-${String(nextNumber).padStart(3, "0")}`;
+            `RKM-${String(
+              nextNumber
+            ).padStart(3, "0")}`;
         }
 
-        const teacherDbId = id("teacher");
+        const teacherDbId =
+          makeId("teacher");
 
         await env.DB
           .prepare(
@@ -1479,7 +2680,10 @@ export default {
               employment_type,
               status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?,
+              ?, ?, ?, ?, ?, ?
+            )
             `
           )
           .bind(
@@ -1495,37 +2699,220 @@ export default {
             body.address || null,
             body.photo_url || null,
             body.joining_date || null,
-            body.employment_type || null,
-            body.status || "active"
+            body.employment_type ||
+              null,
+            body.status ||
+              "active"
           )
           .run();
 
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "teacher",
+          teacherDbId,
+          teacherId
+        );
+
         return ok(
           {
-            message: "Teacher created",
-            teacher_id: teacherId,
-            id: teacherDbId,
+            message:
+              "Teacher created",
+            teacher_id:
+              teacherId,
+            id:
+              teacherDbId,
           },
           origin
         );
       }
 
-      /* =====================================================
-         ADMIN - CREATE ACADEMIC YEAR
-      ===================================================== */
+      /* ===================================================
+         ADMIN TEACHER UPDATE
+      =================================================== */
 
       if (
-        path === "/api/admin/academic-years" &&
+        path.match(
+          /^\/api\/admin\/teachers\/[^/]+$/
+        ) &&
+        method === "PATCH"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const teacherDbId =
+          path.split("/")[4];
+
+        const body =
+          await getBody(request);
+
+        const existing =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM teachers
+              WHERE id = ?
+              `
+            )
+            .bind(
+              teacherDbId
+            )
+            .first();
+
+        if (!existing) {
+          return error(
+            "Teacher not found",
+            404,
+            origin
+          );
+        }
+
+        await env.DB
+          .prepare(
+            `
+            UPDATE teachers
+            SET
+              teacher_id = ?,
+              name = ?,
+              name_bn = ?,
+              subject_id = ?,
+              designation = ?,
+              phone = ?,
+              email = ?,
+              qualification = ?,
+              address = ?,
+              photo_url = ?,
+              joining_date = ?,
+              employment_type = ?,
+              status = ?,
+              updated_at =
+                CURRENT_TIMESTAMP
+            WHERE id = ?
+            `
+          )
+          .bind(
+            body.teacher_id ??
+              existing.teacher_id,
+            body.name ??
+              existing.name,
+            body.name_bn ??
+              existing.name_bn,
+            body.subject_id ??
+              existing.subject_id,
+            body.designation ??
+              existing.designation,
+            body.phone ??
+              existing.phone,
+            body.email ??
+              existing.email,
+            body.qualification ??
+              existing.qualification,
+            body.address ??
+              existing.address,
+            body.photo_url ??
+              existing.photo_url,
+            body.joining_date ??
+              existing.joining_date,
+            body.employment_type ??
+              existing.employment_type,
+            body.status ??
+              existing.status,
+            teacherDbId
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "update",
+          "teacher",
+          teacherDbId
+        );
+
+        return ok(
+          {
+            message:
+              "Teacher updated",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN TEACHER DELETE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/teachers\/[^/]+$/
+        ) &&
+        method === "DELETE"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const teacherDbId =
+          path.split("/")[4];
+
+        await env.DB
+          .prepare(
+            `
+            DELETE FROM teachers
+            WHERE id = ?
+            `
+          )
+          .bind(
+            teacherDbId
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "delete",
+          "teacher",
+          teacherDbId
+        );
+
+        return ok(
+          {
+            message:
+              "Teacher deleted",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN ACADEMIC YEAR CREATE
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/academic-years" &&
         method === "POST"
       ) {
         const admin =
-          await requireAdmin(request, env);
+          await requireAdmin(
+            request,
+            env
+          );
 
-        const body = await getBody(request);
+        const body =
+          await getBody(request);
 
-        const year = Number(body.year);
+        const year =
+          integer(body.year);
 
-        if (!Number.isInteger(year)) {
+        if (year === null) {
           return error(
             "Valid year is required",
             400,
@@ -1533,7 +2920,24 @@ export default {
           );
         }
 
-        const yearId = id("year");
+        const isCurrent =
+          body.is_current
+            ? 1
+            : 0;
+
+        if (isCurrent) {
+          await env.DB
+            .prepare(
+              `
+              UPDATE academic_years
+              SET is_current = 0
+              `
+            )
+            .run();
+        }
+
+        const yearId =
+          makeId("year");
 
         await env.DB
           .prepare(
@@ -1550,37 +2954,117 @@ export default {
           .bind(
             yearId,
             year,
-            body.status || "upcoming",
-            body.is_current ? 1 : 0
+            body.status ||
+              "upcoming",
+            isCurrent
           )
           .run();
 
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "academic_year",
+          yearId,
+          String(year)
+        );
+
         return ok(
           {
-            message: "Academic year created",
-            id: yearId,
+            message:
+              "Academic year created",
+            id:
+              yearId,
           },
           origin
         );
       }
 
-      /* =====================================================
-         ADMIN - CREATE CLASS
-      ===================================================== */
+      /* ===================================================
+         ADMIN SET CURRENT YEAR
+      =================================================== */
 
       if (
-        path === "/api/admin/classes" &&
+        path.match(
+          /^\/api\/admin\/academic-years\/[^/]+\/current$/
+        ) &&
+        method === "PATCH"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const yearId =
+          path.split("/")[4];
+
+        await env.DB
+          .prepare(
+            `
+            UPDATE academic_years
+            SET is_current = 0
+            `
+          )
+          .run();
+
+        await env.DB
+          .prepare(
+            `
+            UPDATE academic_years
+            SET
+              is_current = 1,
+              status = 'active',
+              updated_at =
+                CURRENT_TIMESTAMP
+            WHERE id = ?
+            `
+          )
+          .bind(yearId)
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "set_current",
+          "academic_year",
+          yearId
+        );
+
+        return ok(
+          {
+            message:
+              "Current academic year updated",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN CLASS CREATE
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/classes" &&
         method === "POST"
       ) {
         const admin =
-          await requireAdmin(request, env);
+          await requireAdmin(
+            request,
+            env
+          );
 
-        const body = await getBody(request);
+        const body =
+          await getBody(request);
+
+        const classNumber =
+          integer(
+            body.class_number
+          );
 
         if (
-          !Number.isInteger(
-            Number(body.class_number)
-          ) ||
+          classNumber === null ||
           !body.name
         ) {
           return error(
@@ -1590,7 +3074,8 @@ export default {
           );
         }
 
-        const classId = id("class");
+        const classId =
+          makeId("class");
 
         await env.DB
           .prepare(
@@ -1607,34 +3092,187 @@ export default {
           )
           .bind(
             classId,
-            Number(body.class_number),
+            classNumber,
             body.name,
             body.name_bn || null,
-            body.status || "active"
+            body.status ||
+              "active"
           )
           .run();
 
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "class",
+          classId,
+          body.name
+        );
+
         return ok(
           {
-            message: "Class created",
-            id: classId,
+            message:
+              "Class created",
+            id:
+              classId,
           },
           origin
         );
       }
 
-      /* =====================================================
-         ADMIN - CREATE SUBJECT
-      ===================================================== */
+      /* ===================================================
+         ADMIN CLASS UPDATE
+      =================================================== */
 
       if (
-        path === "/api/admin/subjects" &&
+        path.match(
+          /^\/api\/admin\/classes\/[^/]+$/
+        ) &&
+        method === "PATCH"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const classId =
+          path.split("/")[4];
+
+        const body =
+          await getBody(request);
+
+        const existing =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM classes
+              WHERE id = ?
+              `
+            )
+            .bind(classId)
+            .first();
+
+        if (!existing) {
+          return error(
+            "Class not found",
+            404,
+            origin
+          );
+        }
+
+        await env.DB
+          .prepare(
+            `
+            UPDATE classes
+            SET
+              class_number = ?,
+              name = ?,
+              name_bn = ?,
+              status = ?,
+              updated_at =
+                CURRENT_TIMESTAMP
+            WHERE id = ?
+            `
+          )
+          .bind(
+            body.class_number ==
+              null
+              ? existing.class_number
+              : Number(
+                  body.class_number
+                ),
+            body.name ??
+              existing.name,
+            body.name_bn ??
+              existing.name_bn,
+            body.status ??
+              existing.status,
+            classId
+          )
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "update",
+          "class",
+          classId
+        );
+
+        return ok(
+          {
+            message:
+              "Class updated",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN CLASS DELETE
+      =================================================== */
+
+      if (
+        path.match(
+          /^\/api\/admin\/classes\/[^/]+$/
+        ) &&
+        method === "DELETE"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const classId =
+          path.split("/")[4];
+
+        await env.DB
+          .prepare(
+            `
+            DELETE FROM classes
+            WHERE id = ?
+            `
+          )
+          .bind(classId)
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "delete",
+          "class",
+          classId
+        );
+
+        return ok(
+          {
+            message:
+              "Class deleted",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN SUBJECT CREATE
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/subjects" &&
         method === "POST"
       ) {
         const admin =
-          await requireAdmin(request, env);
+          await requireAdmin(
+            request,
+            env
+          );
 
-        const body = await getBody(request);
+        const body =
+          await getBody(request);
 
         if (!body.name) {
           return error(
@@ -1644,7 +3282,8 @@ export default {
           );
         }
 
-        const subjectId = id("subject");
+        const subjectId =
+          makeId("subject");
 
         await env.DB
           .prepare(
@@ -1658,7 +3297,9 @@ export default {
               pass_marks,
               status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (
+              ?, ?, ?, ?, ?, ?, ?
+            )
             `
           )
           .bind(
@@ -1666,266 +3307,269 @@ export default {
             body.name,
             body.name_bn || null,
             body.code || null,
-            Number(body.full_marks ?? 100),
-            Number(body.pass_marks ?? 33),
-            body.status || "active"
+            Number(
+              body.full_marks ??
+                100
+            ),
+            Number(
+              body.pass_marks ??
+                33
+            ),
+            body.status ||
+              "active"
           )
           .run();
 
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "subject",
+          subjectId,
+          body.name
+        );
+
         return ok(
           {
-            message: "Subject created",
-            id: subjectId,
+            message:
+              "Subject created",
+            id:
+              subjectId,
           },
           origin
         );
       }
 
-      /* =====================================================
-         ADMIN - CREATE EXAM
-      ===================================================== */
+      /* ===================================================
+         ADMIN SUBJECT UPDATE
+      =================================================== */
 
       if (
-        path === "/api/admin/exams" &&
-        method === "POST"
+        path.match(
+          /^\/api\/admin\/subjects\/[^/]+$/
+        ) &&
+        method === "PATCH"
       ) {
         const admin =
-          await requireAdmin(request, env);
+          await requireAdmin(
+            request,
+            env
+          );
 
-        const body = await getBody(request);
+        const subjectId =
+          path.split("/")[4];
 
-        if (
-          !body.exam_type_id ||
-          !body.name
-        ) {
+        const body =
+          await getBody(request);
+
+        const existing =
+          await env.DB
+            .prepare(
+              `
+              SELECT *
+              FROM subjects
+              WHERE id = ?
+              `
+            )
+            .bind(subjectId)
+            .first();
+
+        if (!existing) {
           return error(
-            "exam_type_id and name are required",
-            400,
+            "Subject not found",
+            404,
             origin
           );
         }
 
-        const examId = id("exam");
-
         await env.DB
           .prepare(
             `
-            INSERT INTO exams (
-              id,
-              exam_type_id,
-              name,
-              name_bn,
-              academic_year_id,
-              class_id,
-              group_id,
-              start_date,
-              end_date,
-              status,
-              published,
-              created_by
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            UPDATE subjects
+            SET
+              name = ?,
+              name_bn = ?,
+              code = ?,
+              full_marks = ?,
+              pass_marks = ?,
+              status = ?,
+              updated_at =
+                CURRENT_TIMESTAMP
+            WHERE id = ?
             `
           )
           .bind(
-            examId,
-            body.exam_type_id,
-            body.name,
-            body.name_bn || null,
-            body.academic_year_id || null,
-            body.class_id || null,
-            body.group_id || null,
-            body.start_date || null,
-            body.end_date || null,
-            body.status || "upcoming",
-            body.published ? 1 : 0,
-            admin.user.id
+            body.name ??
+              existing.name,
+            body.name_bn ??
+              existing.name_bn,
+            body.code ??
+              existing.code,
+            body.full_marks ==
+              null
+              ? existing.full_marks
+              : Number(
+                  body.full_marks
+                ),
+            body.pass_marks ==
+              null
+              ? existing.pass_marks
+              : Number(
+                  body.pass_marks
+                ),
+            body.status ??
+              existing.status,
+            subjectId
           )
           .run();
 
+        await adminLog(
+          env,
+          admin.user.id,
+          "update",
+          "subject",
+          subjectId
+        );
+
         return ok(
           {
-            message: "Exam created",
-            id: examId,
+            message:
+              "Subject updated",
           },
           origin
         );
       }
 
-      /* =====================================================
-         ADMIN - CREATE MARKSHEET
-      ===================================================== */
+      /* ===================================================
+         ADMIN SUBJECT DELETE
+      =================================================== */
 
       if (
-        path === "/api/admin/marksheets" &&
+        path.match(
+          /^\/api\/admin\/subjects\/[^/]+$/
+        ) &&
+        method === "DELETE"
+      ) {
+        const admin =
+          await requireAdmin(
+            request,
+            env
+          );
+
+        const subjectId =
+          path.split("/")[4];
+
+        await env.DB
+          .prepare(
+            `
+            DELETE FROM subjects
+            WHERE id = ?
+            `
+          )
+          .bind(subjectId)
+          .run();
+
+        await adminLog(
+          env,
+          admin.user.id,
+          "delete",
+          "subject",
+          subjectId
+        );
+
+        return ok(
+          {
+            message:
+              "Subject deleted",
+          },
+          origin
+        );
+      }
+
+      /* ===================================================
+         ADMIN CLASS SUBJECT CREATE
+      =================================================== */
+
+      if (
+        path ===
+          "/api/admin/class-subjects" &&
         method === "POST"
       ) {
         const admin =
-          await requireAdmin(request, env);
+          await requireAdmin(
+            request,
+            env
+          );
 
-        const body = await getBody(request);
+        const body =
+          await getBody(request);
 
         if (
-          !body.exam_id ||
-          !body.academic_year_id ||
           !body.class_id ||
-          !body.student_name ||
-          body.roll_number == null
+          !body.subject_id
         ) {
           return error(
-            "exam_id, academic_year_id, class_id, student_name and roll_number are required",
+            "class_id and subject_id are required",
             400,
             origin
           );
         }
 
-        const marksheetId = id("marksheet");
+        const idValue =
+          makeId("class_subject");
 
         await env.DB
           .prepare(
             `
-            INSERT INTO marksheets (
+            INSERT INTO class_subjects (
               id,
-              exam_id,
-              academic_year_id,
               class_id,
               group_id,
-              student_name,
-              roll_number,
-              total_marks,
-              percentage,
-              grade,
-              gpa,
-              result_status,
-              rank,
-              published,
-              created_by
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `
-          )
-          .bind(
-            marksheetId,
-            body.exam_id,
-            body.academic_year_id,
-            body.class_id,
-            body.group_id || null,
-            body.student_name,
-            Number(body.roll_number),
-            Number(body.total_marks || 0),
-            Number(body.percentage || 0),
-            body.grade || null,
-            body.gpa == null
-              ? null
-              : Number(body.gpa),
-            body.result_status || null,
-            body.rank == null
-              ? null
-              : Number(body.rank),
-            body.published ? 1 : 0,
-            admin.user.id
-          )
-          .run();
-
-        return ok(
-          {
-            message: "Marksheet created",
-            id: marksheetId,
-          },
-          origin
-        );
-      }
-
-      /* =====================================================
-         ADMIN - CREATE MARKSHEET SUBJECT
-      ===================================================== */
-
-      if (
-        path === "/api/admin/marksheet-subjects" &&
-        method === "POST"
-      ) {
-        const admin =
-          await requireAdmin(request, env);
-
-        const body = await getBody(request);
-
-        if (
-          !body.marksheet_id ||
-          !body.subject_name
-        ) {
-          return error(
-            "marksheet_id and subject_name are required",
-            400,
-            origin
-          );
-        }
-
-        const subjectRowId =
-          id("mark");
-
-        await env.DB
-          .prepare(
-            `
-            INSERT INTO marksheet_subjects (
-              id,
-              marksheet_id,
               subject_id,
-              subject_name,
-              full_marks,
-              pass_marks,
-              obtained_marks,
-              grade,
-              grade_point,
-              remarks,
               display_order
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             `
           )
           .bind(
-            subjectRowId,
-            body.marksheet_id,
-            body.subject_id || null,
-            body.subject_name,
-            Number(body.full_marks || 100),
-            Number(body.pass_marks || 33),
-            Number(body.obtained_marks || 0),
-            body.grade || null,
-            body.grade_point == null
-              ? null
-              : Number(body.grade_point),
-            body.remarks || null,
-            Number(body.display_order || 0)
+            idValue,
+            body.class_id,
+            body.group_id || null,
+            body.subject_id,
+            Number(
+              body.display_order || 0
+            )
           )
           .run();
 
+        await adminLog(
+          env,
+          admin.user.id,
+          "create",
+          "class_subject",
+          idValue
+        );
+
         return ok(
           {
-            message: "Marksheet subject created",
-            id: subjectRowId,
+            message:
+              "Class subject created",
+            id:
+              idValue,
           },
           origin
         );
       }
 
-      /* =====================================================
-         ROUTE NOT FOUND
-      ===================================================== */
+      /* ===================================================
+         ADMIN CLASS SUBJECT DELETE
+      =================================================== */
 
-      return error(
-        "Route not found",
-        404,
-        origin
-      );
-
-    } catch (err) {
-      console.error(err);
-
-      return error(
-        err?.message || "Internal server error",
-        500,
-        origin
-      );
-    }
-  },
-};
+      if (
+        path.match(
+          /^\/api\/admin\/class-subjects\/[^/]+$/
+        ) &&
+        method === "DELETE"
+      ) {
+        const admin =
+          await requireAdminrequireAdmin
