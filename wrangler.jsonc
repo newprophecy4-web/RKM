@@ -1,14 +1,11 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-
   "name": "rkm",
   "main": "src/index.ts",
-
   "compatibility_date": "2026-08-29",
 
   "vars": {
-    "
-    "CORS_ORIGIN": "*"
+    "CORS_ORIGINS": "https://rkm.newprophecy4.workers.dev,http://localhost:5173,http://localhost:3000"
   },
 
   "d1_databases": [
