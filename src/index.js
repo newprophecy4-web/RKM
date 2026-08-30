@@ -217,6 +217,78 @@ async function authLogout(request, env) {
   return response;
 }
 
+async function authRegister(request, env) {
+  const data = await body(request);
+  const name = typeof data.name === "string" ? data.name.trim() : "";
+  const email = typeof data.email === "string" ? data.email.trim().toLowerCase() : "";
+  const password = typeof data.password === "string" ? data.password : "";
+  const phone = typeof data.phone === "string" ? data.phone.trim() : null;
+  if (!name || name.length > 160 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 320 || password.length < 6 || password.length > 4096) {
+    return error("Invalid registration details", 400, request, env);
+  }
+  const existing = await env.DB.prepare(`SELECT id FROM users WHERE LOWER(email) = ? LIMIT 1`).bind(email).first();
+  if (existing) return error("An account with this email already exists", 409, request, env);
+
+  const userId = id("user");
+  const passwordHash = await hashPassword(password);
+  await env.DB.prepare(`INSERT INTO users (id, name, email, phone, password_hash, role, status, last_login_at) VALUES (?, ?, ?, ?, ?, 'user', 'active', CURRENT_TIMESTAMP)`).bind(userId, name, email, phone || null, passwordHash).run();
+  const user = await env.DB.prepare(`SELECT * FROM users WHERE id = ? LIMIT 1`).bind(userId).first();
+  if (!user) throw new Error("User creation failed");
+
+  const token = base64(randomBytes(32));
+  await env.DB.prepare(`INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, last_used_at) VALUES (?, ?, ?, datetime('now', '+7 days'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).bind(id("session"), user.id, await sha256(token)).run();
+  const response = ok({ user: publicUser(user) }, request, env);
+  response.headers.set("Set-Cookie", sessionCookie(token));
+  return response;
+}
+
+async function updateMe(request, env) {
+  const auth = await authenticate(request, env);
+  const data = await body(request);
+  const fields = [];
+  const values = [];
+  if (data.name !== undefined) {
+    if (typeof data.name !== "string" || !data.name.trim() || data.name.length > 160) return error("Invalid name", 400, request, env);
+    fields.push("name = ?"); values.push(data.name.trim());
+  }
+  if (data.phone !== undefined) {
+    if (data.phone !== null && (typeof data.phone !== "string" || data.phone.length > 40)) return error("Invalid phone", 400, request, env);
+    fields.push("phone = ?"); values.push(data.phone ? data.phone.trim() : null);
+  }
+  if (data.photo_url !== undefined) {
+    if (data.photo_url !== null && (typeof data.photo_url !== "string" || data.photo_url.length > 2048)) return error("Invalid photo URL", 400, request, env);
+    fields.push("photo_url = ?"); values.push(data.photo_url || null);
+  }
+  if (!fields.length) return ok({ user: publicUser(auth.user) }, request, env);
+  fields.push("updated_at = CURRENT_TIMESTAMP");
+  await env.DB.prepare(`UPDATE users SET ${fields.join(", ")} WHERE id = ?`).bind(...values, auth.user.id).run();
+  const user = await env.DB.prepare(`SELECT * FROM users WHERE id = ? LIMIT 1`).bind(auth.user.id).first();
+  return ok({ user: publicUser(user || auth.user) }, request, env);
+}
+
+async function authForgotPassword(request, env) {
+  await body(request);
+  return ok({ message: "If an account exists for this email, password reset instructions will be provided by the administrator." }, request, env);
+}
+
+async function uploadImage(request, env) {
+  const auth = await requireAdmin(request, env);
+  const contentLength = Number(request.headers.get("Content-Length") || 0);
+  if (contentLength > 10 * 1024 * 1024) return error("Upload too large", 413, request, env);
+  if (!env.IMGBB_API_KEY) return error("Image upload is not configured", 503, request, env);
+  const form = await request.formData();
+  const image = form.get("image");
+  if (!(image instanceof File) && typeof image !== "string") return error("Image is required", 400, request, env);
+  if (image instanceof File && (!image.type.startsWith("image/") || image.size > 10 * 1024 * 1024)) return error("Invalid image", 400, request, env);
+  const upload = new FormData();
+  upload.append("image", image);
+  const result = await fetch(`https://api.imgbb.com/1/upload?key=${encodeURIComponent(env.IMGBB_API_KEY)}`, { method: "POST", body: upload });
+  if (!result.ok) return error("Image upload failed", 502, request, env);
+  const data = await result.json();
+  if (!data?.success || !data?.data?.display_url) return error("Image upload failed", 502, request, env);
+  return ok({ url: data.data.display_url, deleteUrl: data.data.delete_url || null }, request, env);
+}
+
 /* =======================================================
    ADMIN LOG
 ======================================================= */
@@ -4183,6 +4255,13 @@ export default {
 
       if (
         request.method === "POST" &&
+        path === "/api/auth/register"
+      ) {
+        return await authRegister(request, env);
+      }
+
+      if (
+        request.method === "POST" &&
         path === "/api/auth/logout"
       ) {
         return await authLogout(request, env);
@@ -4204,6 +4283,20 @@ export default {
           request,
           env
         );
+      }
+
+      if (
+        request.method === "PATCH" &&
+        path === "/api/me"
+      ) {
+        return await updateMe(request, env);
+      }
+
+      if (
+        request.method === "POST" &&
+        path === "/api/auth/forgot-password"
+      ) {
+        return await authForgotPassword(request, env);
       }
 
 
@@ -4240,6 +4333,13 @@ export default {
       /* =================================================
          ADMIN AUTH
       ================================================= */
+
+      if (
+        request.method === "POST" &&
+        path === "/api/upload"
+      ) {
+        return await uploadImage(request, env);
+      }
 
       if (
         path.startsWith("/api/admin/")
