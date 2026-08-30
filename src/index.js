@@ -33,76 +33,49 @@ const FIREBASE_KEYS =
    RESPONSE HELPERS
 ======================================================= */
 
-function json(data, status = 200, request = null) {
-  const origin = request?.headers.get("Origin") || "*";
-
-  return new Response(
-    JSON.stringify(data),
-    {
-      status,
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-
-        "Access-Control-Allow-Origin": origin,
-
-        "Access-Control-Allow-Headers":
-          "Content-Type, Authorization",
-
-        "Access-Control-Allow-Methods":
-          "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-
-        "Access-Control-Allow-Credentials":
-          "true",
-
-        "Cache-Control":
-          "no-store"
-      }
-    }
-  );
+function allowedOrigins(env) {
+  return String(env?.CORS_ORIGINS || env?.CORS_ORIGIN || "https://rkm.newprophecy4.workers.dev,http://localhost:5173,http://localhost:3000")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter((origin) => origin && origin !== "*" && origin !== "null");
 }
 
-
-function ok(data, request) {
-  return json(
-    {
-      success: true,
-      ...data
-    },
-    200,
-    request
-  );
+function corsHeaders(request, env) {
+  const origin = request?.headers.get("Origin");
+  const headers = {
+    "Content-Type": "application/json; charset=utf-8",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "Access-Control-Allow-Credentials": "true",
+    "Cache-Control": "no-store",
+    "Vary": "Origin"
+  };
+  if (origin && allowedOrigins(env).includes(origin)) {
+    headers["Access-Control-Allow-Origin"] = origin;
+  }
+  return headers;
 }
 
-
-function error(message, status = 400, request) {
-  return json(
-    {
-      success: false,
-      error: message
-    },
+function json(data, status = 200, request = null, env = null) {
+  return new Response(JSON.stringify(data), {
     status,
-    request
-  );
+    headers: corsHeaders(request, env)
+  });
 }
 
 
-function options(request) {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      "Access-Control-Allow-Origin":
-        request.headers.get("Origin") || "*",
+function ok(data, request, env) {
+  return json({ success: true, ...data }, 200, request, env);
+}
 
-      "Access-Control-Allow-Headers":
-        "Content-Type, Authorization",
 
-      "Access-Control-Allow-Methods":
-        "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+function error(message, status = 400, request, env) {
+  return json({ success: false, error: message }, status, request, env);
+}
 
-      "Access-Control-Allow-Credentials":
-        "true"
-    }
-  });
+
+function options(request, env) {
+  return new Response(null, { status: 204, headers: corsHeaders(request, env) });
 }
 
 
@@ -182,11 +155,8 @@ function getBearer(request) {
     return null;
   }
 
-  if (!header.startsWith("Bearer ")) {
-    return null;
-  }
-
-  return header.substring(7);
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() || null;
 }
 
 
@@ -526,9 +496,10 @@ async function getSettings(request, env) {
     .all();
 
   const settings = {};
+  const sensitiveKey = /(api.?key|secret|private.?key|token|credential|password)/i;
 
   for (const row of rows.results || []) {
-    settings[row.key] = row.value;
+    if (!sensitiveKey.test(String(row.key))) settings[row.key] = row.value;
   }
 
   return ok({ settings }, request);
@@ -4133,7 +4104,7 @@ export default {
   async fetch(request, env) {
 
     if (request.method === "OPTIONS") {
-      return options(request);
+      return options(request, env);
     }
 
 
@@ -4856,52 +4827,24 @@ export default {
       console.error(e);
 
 
-      if (
-        e.message ===
-        "Authentication required"
-      ) {
-
-        return error(
-          e.message,
-          401,
-          request
-        );
+            const message = String(e?.message || "");
+      if (message === "Authentication required" || message === "Missing Firebase token") {
+        return error("Unauthorized", 401, request, env);
       }
-
-
-      if (
-        e.message ===
-        "Admin access required"
-      ) {
-
-        return error(
-          e.message,
-          403,
-          request
-        );
+      if (message === "Admin access required") {
+        return error("Forbidden", 403, request, env);
       }
-
-
       if (
-        e.message.includes(
-          "Firebase"
-        )
+        message.includes("JWT") ||
+        message.includes("JWS") ||
+        message.includes("token") ||
+        message.includes("Firebase") ||
+        message.includes("signature") ||
+        message.includes("expired")
       ) {
-
-        return error(
-          "Invalid or expired Firebase token",
-          401,
-          request
-        );
+        return error("Invalid authentication token", 401, request, env);
       }
-
-
-      return error(
-        e.message ||
-          "Internal Server Error",
-        500,
-        request
-      );
+      return error("Internal server error", 500, request, env);
     }
   }
 };
