@@ -171,12 +171,16 @@ function getBearer(request) {
   const header =
     request.headers.get("Authorization");
 
-  if (!header) {
+  if (typeof header !== "string" || !header.trim()) {
     return null;
   }
 
   const match = header.trim().match(/^Bearer\s+(\S+)$/i);
-  return match?.[1] || null;
+  if (!match || !match[1] || /\s/.test(match[1])) {
+    return null;
+  }
+
+  return match[1];
 }
 
 
@@ -234,7 +238,7 @@ async function requireAdmin(request, env) {
     await authenticate(request, env);
 
   if (auth.user.role !== "admin") {
-    throw new Error("Admin access required");
+    throw new ApiAuthError("Forbidden", "forbidden");
   }
 
   return auth;
@@ -440,7 +444,7 @@ async function calculateMarksheet(
    ROOT
 ======================================================= */
 
-async function root(request) {
+async function root(request, env) {
 
   return ok(
     {
@@ -459,7 +463,8 @@ async function root(request) {
       database:
         "Cloudflare D1"
     },
-    request
+    request,
+    env
   );
 }
 
@@ -4123,17 +4128,16 @@ export default {
     }
 
 
-    const url =
-      new URL(request.url);
-
-    const path =
-      url.pathname.replace(
-        /\/+$/,
-        ""
-      ) || "/";
-
-
     try {
+
+      const url =
+        new URL(request.url);
+
+      const path =
+        url.pathname.replace(
+          /\/+$/,
+          ""
+        ) || "/";
 
       /* =================================================
          PUBLIC
@@ -4143,7 +4147,7 @@ export default {
         request.method === "GET" &&
         path === "/"
       ) {
-        return root(request);
+        return root(request, env);
       }
 
 
@@ -4839,8 +4843,6 @@ export default {
 
         } catch (e) {
 
-      console.error(e);
-
       if (e?.code === "unauthorized") {
         return error("Unauthorized", 401, request, env);
       }
@@ -4854,7 +4856,7 @@ export default {
         );
       }
 
-      if (e?.code === "forbidden" || e?.message === "Admin access required") {
+      if (e?.code === "forbidden") {
         return error("Forbidden", 403, request, env);
       }
 
