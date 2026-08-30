@@ -119,6 +119,15 @@ function bool(value) {
 }
 
 
+class ApiAuthError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.name = "ApiAuthError";
+    this.code = code;
+  }
+}
+
+
 /* =======================================================
    FIREBASE AUTH
 ======================================================= */
@@ -126,23 +135,34 @@ function bool(value) {
 async function verifyFirebaseToken(token) {
 
   if (!token) {
-    throw new Error("Missing Firebase token");
+    throw new ApiAuthError("Unauthorized", "unauthorized");
   }
 
-  const { payload } = await jwtVerify(
-    token,
-    FIREBASE_KEYS,
-    {
-      issuer: FIREBASE_ISSUER,
-      audience: PROJECT_ID
+  try {
+    const { payload } = await jwtVerify(
+      token,
+      FIREBASE_KEYS,
+      {
+        issuer: FIREBASE_ISSUER,
+        audience: PROJECT_ID
+      }
+    );
+
+    if (!payload.sub) {
+      throw new Error("Missing Firebase subject");
     }
-  );
 
-  if (!payload.sub) {
-    throw new Error("Invalid Firebase token");
+    return payload;
+  } catch (e) {
+    if (e instanceof ApiAuthError) {
+      throw e;
+    }
+
+    throw new ApiAuthError(
+      "Invalid authentication token",
+      "invalid_token"
+    );
   }
-
-  return payload;
 }
 
 
@@ -155,8 +175,8 @@ function getBearer(request) {
     return null;
   }
 
-  const match = header.match(/^Bearer\s+(.+)$/i);
-  return match?.[1]?.trim() || null;
+  const match = header.trim().match(/^Bearer\s+(\S+)$/i);
+  return match?.[1] || null;
 }
 
 
@@ -170,7 +190,7 @@ async function authenticate(request, env) {
     getBearer(request);
 
   if (!token) {
-    throw new Error("Authentication required");
+    throw new ApiAuthError("Unauthorized", "unauthorized");
   }
 
   const firebase =
@@ -193,14 +213,12 @@ async function authenticate(request, env) {
 
   if (!user) {
 
-    throw new Error(
-      "User profile not found. Call /api/auth/sync first."
-    );
+    throw new ApiAuthError("Unauthorized", "unauthorized");
 
   }
 
   if (user.status !== "active") {
-    throw new Error("Account is not active");
+    throw new ApiAuthError("Forbidden", "forbidden");
   }
 
   return {
@@ -2862,10 +2880,11 @@ async function getHeroAds(
     .all();
 
 
+  const heroAds = (rows.results || []).map(({ created_by, ...heroAd }) => heroAd);
+
   return ok(
     {
-      hero_ads:
-        rows.results || []
+      hero_ads: heroAds
     },
     request
   );
@@ -3274,11 +3293,7 @@ async function authSync(
 
   if (!token) {
 
-    return error(
-      "Firebase token required",
-      401,
-      request
-    );
+    throw new ApiAuthError("Unauthorized", "unauthorized");
   }
 
 
@@ -4822,28 +4837,27 @@ export default {
       );
 
 
-    } catch (e) {
+        } catch (e) {
 
       console.error(e);
 
-
-            const message = String(e?.message || "");
-      if (message === "Authentication required" || message === "Missing Firebase token") {
+      if (e?.code === "unauthorized") {
         return error("Unauthorized", 401, request, env);
       }
-      if (message === "Admin access required") {
+
+      if (e?.code === "invalid_token") {
+        return error(
+          "Invalid authentication token",
+          401,
+          request,
+          env
+        );
+      }
+
+      if (e?.code === "forbidden" || e?.message === "Admin access required") {
         return error("Forbidden", 403, request, env);
       }
-      if (
-        message.includes("JWT") ||
-        message.includes("JWS") ||
-        message.includes("token") ||
-        message.includes("Firebase") ||
-        message.includes("signature") ||
-        message.includes("expired")
-      ) {
-        return error("Invalid authentication token", 401, request, env);
-      }
+
       return error("Internal server error", 500, request, env);
     }
   }
