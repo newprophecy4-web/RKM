@@ -3,11 +3,9 @@
   "name": "rkm",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-29",
-
   "vars": {
-    "CORS_ORIGINS": "https://rkm.newprophecy4.workers.dev,http://localhost:5173,http://localhost:3000"
+    "CORS_ORIGINS": "https://ais-pre-4msgr2nswmlypx42smi7zb-400902016744.asia-east1.run.app,https://rkm.newprophecy4.workers.dev,http://localhost:5173,http://localhost:3000"
   },
-
   "d1_databases": [
     {
       "binding": "DB",
