@@ -1,3 +1,6 @@
+// Cloudflare Worker API entrypoint converted from pasted JavaScript.
+// @ts-nocheck
+
 /* =======================================================
    RESPONSE HELPERS
 ======================================================= */
