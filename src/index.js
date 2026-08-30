@@ -1,34 +1,3 @@
-import { jwtVerify, createRemoteJWKSet } from "jose";
-
-/*
-=========================================================
-RAJARHAT KAMIL MADRASHA
-CLOUDFLARE WORKER API V2
-
-Firebase Authentication
-Cloudflare D1
-ImgBB image URLs
-Optional R2 documents
-
-API BASE:
-https://rkm.newprophecy4.workers.dev
-=========================================================
-*/
-
-
-const PROJECT_ID = "rkm-2026-969da";
-
-const FIREBASE_ISSUER =
-  `https://securetoken.google.com/${PROJECT_ID}`;
-
-const FIREBASE_KEYS =
-  createRemoteJWKSet(
-    new URL(
-      "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com"
-    )
-  );
-
-
 /* =======================================================
    RESPONSE HELPERS
 ======================================================= */
@@ -44,6 +13,8 @@ function corsHeaders(request, env) {
   const origin = request?.headers.get("Origin");
   const headers = {
     "Content-Type": "application/json; charset=utf-8",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
     "Access-Control-Allow-Credentials": "true",
@@ -129,121 +100,122 @@ class ApiAuthError extends Error {
 
 
 /* =======================================================
-   FIREBASE AUTH
+   D1 SESSION AUTHENTICATION
 ======================================================= */
 
-async function verifyFirebaseToken(token) {
+const SESSION_DAYS = 7;
+const PASSWORD_ITERATIONS = 100000;
 
-  if (!token) {
-    throw new ApiAuthError("Unauthorized", "unauthorized");
-  }
+function authError(message, code) {
+  return new ApiAuthError(message, code);
+}
 
+function getCookie(request, name) {
+  const header = request.headers.get("Cookie") || "";
+  const match = header.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
+  if (!match) return null;
   try {
-    const { payload } = await jwtVerify(
-      token,
-      FIREBASE_KEYS,
-      {
-        issuer: FIREBASE_ISSUER,
-        audience: PROJECT_ID
-      }
-    );
-
-    if (!payload.sub) {
-      throw new Error("Missing Firebase subject");
-    }
-
-    return payload;
-  } catch (e) {
-    if (e instanceof ApiAuthError) {
-      throw e;
-    }
-
-    throw new ApiAuthError(
-      "Invalid authentication token",
-      "invalid_token"
-    );
+    return decodeURIComponent(match[1]);
+  } catch {
+    return "";
   }
 }
 
-
-function getBearer(request) {
-
-  const header =
-    request.headers.get("Authorization");
-
-  if (typeof header !== "string" || !header.trim()) {
-    return null;
-  }
-
-  const match = header.trim().match(/^Bearer\s+(\S+)$/i);
-  if (!match || !match[1] || /\s/.test(match[1])) {
-    return null;
-  }
-
-  return match[1];
+function sessionCookie(token, maxAge = SESSION_DAYS * 24 * 60 * 60) {
+  return `session=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`;
 }
 
+async function sha256(value) {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
-/* =======================================================
-   CURRENT USER
-======================================================= */
+function randomBytes(size = 32) {
+  const bytes = new Uint8Array(size);
+  crypto.getRandomValues(bytes);
+  return bytes;
+}
+
+function base64(bytes) {
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function hashPassword(password, salt = base64(randomBytes())) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: new TextEncoder().encode(salt), iterations: PASSWORD_ITERATIONS, hash: "SHA-256" }, key, 256);
+  return `pbkdf2$sha256$${PASSWORD_ITERATIONS}$${salt}$${base64(new Uint8Array(bits))}`;
+}
+
+async function verifyPassword(password, encoded) {
+  if (typeof encoded !== "string" || !encoded.startsWith("pbkdf2$")) return false;
+  const [, algorithm, iterations, salt, expected] = encoded.split("$");
+  if (algorithm !== "sha256" || !Number.isSafeInteger(Number(iterations)) || !salt || !expected) return false;
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: new TextEncoder().encode(salt), iterations: Number(iterations), hash: "SHA-256" }, key, 256);
+  return base64(new Uint8Array(bits)) === expected;
+}
+
+function publicUser(user) {
+  return { id: user.id, name: user.name, email: user.email, role: user.role, status: user.status };
+}
 
 async function authenticate(request, env) {
+  const token = getCookie(request, "session");
+  if (token === null) throw authError("Unauthorized", "unauthorized");
+  if (!token) throw authError("Invalid or expired session", "invalid_session");
 
-  const token =
-    getBearer(request);
-
-  if (!token) {
-    throw new ApiAuthError("Unauthorized", "unauthorized");
+  let tokenHash;
+  try {
+    tokenHash = await sha256(token);
+    const session = await env.DB.prepare(`SELECT id, user_id, expires_at FROM sessions WHERE token_hash = ? LIMIT 1`).bind(tokenHash).first();
+    if (!session || !session.expires_at || new Date(session.expires_at).getTime() <= Date.now()) {
+      throw authError("Invalid or expired session", "invalid_session");
+    }
+    const user = await env.DB.prepare(`SELECT * FROM users WHERE id = ? LIMIT 1`).bind(session.user_id).first();
+    if (!user) throw authError("Invalid or expired session", "invalid_session");
+    if (user.status === "inactive") throw authError("Account is inactive", "inactive");
+    if (user.status === "suspended") throw authError("Account is suspended", "suspended");
+    if (user.status !== "active") throw authError("Unauthorized", "unauthorized");
+    await env.DB.prepare(`UPDATE sessions SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(session.id).run();
+    return { user, session };
+  } catch (e) {
+    if (e instanceof ApiAuthError) throw e;
+    throw e;
   }
-
-  const firebase =
-    await verifyFirebaseToken(token);
-
-  const uid =
-    firebase.sub;
-
-  const user =
-    await env.DB.prepare(
-      `
-      SELECT *
-      FROM users
-      WHERE firebase_uid = ?
-      LIMIT 1
-      `
-    )
-    .bind(uid)
-    .first();
-
-  if (!user) {
-
-    throw new ApiAuthError("Unauthorized", "unauthorized");
-
-  }
-
-  if (user.status !== "active") {
-    throw new ApiAuthError("Forbidden", "forbidden");
-  }
-
-  return {
-    firebase,
-    user
-  };
 }
 
-
 async function requireAdmin(request, env) {
-
-  const auth =
-    await authenticate(request, env);
-
-  if (auth.user.role !== "admin") {
-    throw new ApiAuthError("Forbidden", "forbidden");
-  }
-
+  const auth = await authenticate(request, env);
+  if (auth.user.role !== "admin") throw authError("Forbidden", "forbidden");
   return auth;
 }
 
+async function authLogin(request, env) {
+  const data = await body(request);
+  const email = typeof data.email === "string" ? data.email.trim().toLowerCase() : "";
+  const password = typeof data.password === "string" ? data.password : "";
+  if (!email || !password || email.length > 320 || password.length > 4096) return error("Invalid credentials", 401, request, env);
+  const user = await env.DB.prepare(`SELECT * FROM users WHERE LOWER(email) = ? LIMIT 1`).bind(email).first();
+  const valid = user && await verifyPassword(password, user.password_hash);
+  if (!valid) return error("Invalid credentials", 401, request, env);
+  if (user.status === "inactive") return error("Account is inactive", 403, request, env);
+  if (user.status === "suspended") return error("Account is suspended", 403, request, env);
+  if (user.status !== "active") return error("Invalid credentials", 401, request, env);
+  const token = base64(randomBytes(32));
+  await env.DB.prepare(`INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, last_used_at) VALUES (?, ?, ?, datetime('now', '+7 days'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).bind(id("session"), user.id, await sha256(token)).run();
+  const response = ok({ user: publicUser(user) }, request, env);
+  response.headers.set("Set-Cookie", sessionCookie(token));
+  return response;
+}
+
+async function authLogout(request, env) {
+  const token = getCookie(request, "session");
+  if (token) await env.DB.prepare(`DELETE FROM sessions WHERE token_hash = ?`).bind(await sha256(token)).run();
+  const response = ok({ message: "Logged out successfully" }, request, env);
+  response.headers.set("Set-Cookie", sessionCookie("", 0));
+  return response;
+}
 
 /* =======================================================
    ADMIN LOG
@@ -458,7 +430,7 @@ async function root(request, env) {
         "running",
 
       authentication:
-        "Firebase Authentication",
+        "D1 session authentication",
 
       database:
         "Cloudflare D1"
@@ -3287,159 +3259,9 @@ async function getMe(
    AUTH SYNC
 ======================================================= */
 
-async function authSync(
-  request,
-  env
-) {
-
-  const token =
-    getBearer(request);
-
-
-  if (!token) {
-
-    throw new ApiAuthError("Unauthorized", "unauthorized");
-  }
-
-
-  const firebase =
-    await verifyFirebaseToken(
-      token
-    );
-
-
-  const uid =
-    firebase.sub;
-
-
-  const existing =
-    await env.DB.prepare(
-      `
-      SELECT *
-      FROM users
-      WHERE firebase_uid = ?
-      LIMIT 1
-      `
-    )
-    .bind(uid)
-    .first();
-
-
-  const name =
-    firebase.name ||
-    firebase.email ||
-    "User";
-
-
-  const email =
-    firebase.email ||
-    null;
-
-
-  const photo =
-    firebase.picture ||
-    null;
-
-
-  if (existing) {
-
-    await env.DB.prepare(
-      `
-      UPDATE users
-      SET
-        name = ?,
-        email = ?,
-        photo_url = ?,
-        last_login_at = CURRENT_TIMESTAMP,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE firebase_uid = ?
-      `
-    )
-    .bind(
-      name,
-      email,
-      photo,
-      uid
-    )
-    .run();
-
-
-    const user =
-      await env.DB.prepare(
-        `
-        SELECT *
-        FROM users
-        WHERE firebase_uid = ?
-        `
-      )
-      .bind(uid)
-      .first();
-
-
-    return ok(
-      {
-        user
-      },
-      request
-    );
-  }
-
-
-  /*
-  New users are ALWAYS user.
-
-  Admin role must be manually assigned
-  in D1/Admin Panel.
-  */
-
-  const userId =
-    id("user");
-
-
-  await env.DB.prepare(
-    `
-    INSERT INTO users
-    (
-      id,
-      firebase_uid,
-      name,
-      email,
-      photo_url,
-      role,
-      status,
-      last_login_at
-    )
-    VALUES (?, ?, ?, ?, ?, 'user', 'active', CURRENT_TIMESTAMP)
-    `
-  )
-  .bind(
-    userId,
-    uid,
-    name,
-    email,
-    photo
-  )
-  .run();
-
-
-  const user =
-    await env.DB.prepare(
-      `
-      SELECT *
-      FROM users
-      WHERE id = ?
-      `
-    )
-    .bind(userId)
-    .first();
-
-
-  return ok(
-    {
-      user
-    },
-    request
-  );
+async function authSync(request, env) {
+  const auth = await authenticate(request, env);
+  return ok({ user: publicUser(auth.user) }, request, env);
 }
 
 
@@ -3457,7 +3279,6 @@ async function getAdminUsers(
       `
       SELECT
         id,
-        firebase_uid,
         name,
         email,
         phone,
@@ -4124,7 +3945,7 @@ export default {
   async fetch(request, env) {
 
     if (request.method === "OPTIONS") {
-      return options(request, env);
+      return await options(request, env);
     }
 
 
@@ -4147,7 +3968,7 @@ export default {
         request.method === "GET" &&
         path === "/"
       ) {
-        return root(request, env);
+        return await root(request, env);
       }
 
 
@@ -4155,7 +3976,7 @@ export default {
         request.method === "GET" &&
         path === "/api/health"
       ) {
-        return health(
+        return await health(
           request,
           env
         );
@@ -4166,7 +3987,7 @@ export default {
         request.method === "GET" &&
         path === "/api/settings"
       ) {
-        return getSettings(
+        return await getSettings(
           request,
           env
         );
@@ -4177,7 +3998,7 @@ export default {
         request.method === "GET" &&
         path === "/api/academic-years"
       ) {
-        return getAcademicYears(
+        return await getAcademicYears(
           request,
           env
         );
@@ -4188,7 +4009,7 @@ export default {
         request.method === "GET" &&
         path === "/api/classes"
       ) {
-        return getClasses(
+        return await getClasses(
           request,
           env
         );
@@ -4199,7 +4020,7 @@ export default {
         request.method === "GET" &&
         path === "/api/groups"
       ) {
-        return getGroups(
+        return await getGroups(
           request,
           env
         );
@@ -4210,7 +4031,7 @@ export default {
         request.method === "GET" &&
         path === "/api/subjects"
       ) {
-        return getSubjects(
+        return await getSubjects(
           request,
           env
         );
@@ -4221,7 +4042,7 @@ export default {
         request.method === "GET" &&
         path === "/api/teachers"
       ) {
-        return getTeachers(
+        return await getTeachers(
           request,
           env
         );
@@ -4232,7 +4053,7 @@ export default {
         request.method === "GET" &&
         path === "/api/exam-types"
       ) {
-        return getExamTypes(
+        return await getExamTypes(
           request,
           env
         );
@@ -4243,7 +4064,7 @@ export default {
         request.method === "GET" &&
         path === "/api/exams"
       ) {
-        return getExams(
+        return await getExams(
           request,
           env
         );
@@ -4254,7 +4075,7 @@ export default {
         request.method === "GET" &&
         path === "/api/exam-subjects"
       ) {
-        return getExamSubjects(
+        return await getExamSubjects(
           request,
           env
         );
@@ -4265,7 +4086,7 @@ export default {
         request.method === "GET" &&
         path === "/api/marksheets"
       ) {
-        return getMarksheets(
+        return await getMarksheets(
           request,
           env
         );
@@ -4276,7 +4097,7 @@ export default {
         request.method === "GET" &&
         path === "/api/class-marksheet"
       ) {
-        return getClassMarksheet(
+        return await getClassMarksheet(
           request,
           env
         );
@@ -4287,7 +4108,7 @@ export default {
         request.method === "GET" &&
         path === "/api/results"
       ) {
-        return getBoardResults(
+        return await getBoardResults(
           request,
           env
         );
@@ -4298,7 +4119,7 @@ export default {
         request.method === "GET" &&
         path === "/api/notices"
       ) {
-        return getNotices(
+        return await getNotices(
           request,
           env
         );
@@ -4309,7 +4130,7 @@ export default {
         request.method === "GET" &&
         path === "/api/hero-ads"
       ) {
-        return getHeroAds(
+        return await getHeroAds(
           request,
           env
         );
@@ -4320,7 +4141,7 @@ export default {
         request.method === "GET" &&
         path === "/api/events"
       ) {
-        return getEvents(
+        return await getEvents(
           request,
           env
         );
@@ -4331,7 +4152,7 @@ export default {
         request.method === "GET" &&
         path === "/api/gallery"
       ) {
-        return getGallery(
+        return await getGallery(
           request,
           env
         );
@@ -4342,7 +4163,7 @@ export default {
         request.method === "GET" &&
         path === "/api/documents"
       ) {
-        return getDocuments(
+        return await getDocuments(
           request,
           env
         );
@@ -4355,12 +4176,23 @@ export default {
 
       if (
         request.method === "POST" &&
+        path === "/api/auth/login"
+      ) {
+        return await authLogin(request, env);
+      }
+
+      if (
+        request.method === "POST" &&
+        path === "/api/auth/logout"
+      ) {
+        return await authLogout(request, env);
+      }
+
+      if (
+        request.method === "POST" &&
         path === "/api/auth/sync"
       ) {
-        return authSync(
-          request,
-          env
-        );
+        return await authSync(request, env);
       }
 
 
@@ -4368,7 +4200,7 @@ export default {
         request.method === "GET" &&
         path === "/api/me"
       ) {
-        return getMe(
+        return await getMe(
           request,
           env
         );
@@ -4379,7 +4211,7 @@ export default {
         request.method === "GET" &&
         path === "/api/notifications"
       ) {
-        return getNotifications(
+        return await getNotifications(
           request,
           env
         );
@@ -4397,7 +4229,7 @@ export default {
         notificationMatch
       ) {
 
-        return markNotificationRead(
+        return await markNotificationRead(
           request,
           env,
           notificationMatch[1]
@@ -4429,7 +4261,7 @@ export default {
           path === "/api/admin/settings"
         ) {
 
-          return updateSettings(
+          return await updateSettings(
             request,
             env,
             auth
@@ -4446,7 +4278,7 @@ export default {
           path === "/api/admin/users"
         ) {
 
-          return getAdminUsers(
+          return await getAdminUsers(
             request,
             env
           );
@@ -4464,7 +4296,7 @@ export default {
           roleMatch
         ) {
 
-          return updateUserRole(
+          return await updateUserRole(
             request,
             env,
             auth,
@@ -4484,7 +4316,7 @@ export default {
           statusMatch
         ) {
 
-          return updateUserStatus(
+          return await updateUserStatus(
             request,
             env,
             auth,
@@ -4502,7 +4334,7 @@ export default {
           path === "/api/admin/academic-years"
         ) {
 
-          return createAcademicYear(
+          return await createAcademicYear(
             request,
             env,
             auth
@@ -4521,7 +4353,7 @@ export default {
           promoteMatch
         ) {
 
-          return promoteAcademicYear(
+          return await promoteAcademicYear(
             request,
             env,
             auth,
@@ -4539,7 +4371,7 @@ export default {
           path === "/api/admin/classes"
         ) {
 
-          return createClass(
+          return await createClass(
             request,
             env,
             auth
@@ -4556,7 +4388,7 @@ export default {
           path === "/api/admin/subjects"
         ) {
 
-          return createSubject(
+          return await createSubject(
             request,
             env,
             auth
@@ -4573,7 +4405,7 @@ export default {
           path === "/api/admin/teachers"
         ) {
 
-          return createTeacher(
+          return await createTeacher(
             request,
             env,
             auth
@@ -4590,7 +4422,7 @@ export default {
           path === "/api/admin/exams"
         ) {
 
-          return createExam(
+          return await createExam(
             request,
             env,
             auth
@@ -4607,7 +4439,7 @@ export default {
           path === "/api/admin/exam-subjects"
         ) {
 
-          return createExamSubject(
+          return await createExamSubject(
             request,
             env,
             auth
@@ -4624,7 +4456,7 @@ export default {
           path === "/api/admin/marksheets"
         ) {
 
-          return createMarksheet(
+          return await createMarksheet(
             request,
             env,
             auth
@@ -4647,7 +4479,7 @@ export default {
           addSubjectMatch
         ) {
 
-          return addMarksheetSubject(
+          return await addMarksheetSubject(
             request,
             env,
             auth,
@@ -4671,7 +4503,7 @@ export default {
           request.method === "PATCH"
         ) {
 
-          return updateMarksheetSubject(
+          return await updateMarksheetSubject(
             request,
             env,
             auth,
@@ -4685,7 +4517,7 @@ export default {
           request.method === "DELETE"
         ) {
 
-          return deleteMarksheetSubject(
+          return await deleteMarksheetSubject(
             request,
             env,
             auth,
@@ -4709,7 +4541,7 @@ export default {
           rankMatch
         ) {
 
-          return updateRank(
+          return await updateRank(
             request,
             env,
             auth,
@@ -4727,7 +4559,7 @@ export default {
           path === "/api/admin/results"
         ) {
 
-          return createBoardResult(
+          return await createBoardResult(
             request,
             env,
             auth
@@ -4744,7 +4576,7 @@ export default {
           path === "/api/admin/notices"
         ) {
 
-          return createNotice(
+          return await createNotice(
             request,
             env,
             auth
@@ -4761,7 +4593,7 @@ export default {
           path === "/api/admin/hero-ads"
         ) {
 
-          return createHeroAd(
+          return await createHeroAd(
             request,
             env,
             auth
@@ -4778,7 +4610,7 @@ export default {
           path === "/api/admin/events"
         ) {
 
-          return createEvent(
+          return await createEvent(
             request,
             env,
             auth
@@ -4795,7 +4627,7 @@ export default {
           path === "/api/admin/gallery"
         ) {
 
-          return createGallery(
+          return await createGallery(
             request,
             env,
             auth
@@ -4803,7 +4635,7 @@ export default {
         }
 
 
-        return error(
+        return await error(
           "Admin route not found",
           404,
           request
@@ -4826,7 +4658,7 @@ export default {
         singleMarksheetMatch
       ) {
 
-        return getSingleMarksheet(
+        return await getSingleMarksheet(
           request,
           env,
           singleMarksheetMatch[1]
@@ -4834,7 +4666,7 @@ export default {
       }
 
 
-      return error(
+      return await error(
         "Route not found",
         404,
         request
@@ -4844,23 +4676,26 @@ export default {
         } catch (e) {
 
       if (e?.code === "unauthorized") {
-        return error("Unauthorized", 401, request, env);
+        return await error("Unauthorized", 401, request, env);
       }
 
-      if (e?.code === "invalid_token") {
-        return error(
-          "Invalid authentication token",
-          401,
-          request,
-          env
-        );
+      if (e?.code === "invalid_session") {
+        return await error("Invalid or expired session", 401, request, env);
+      }
+
+      if (e?.code === "inactive") {
+        return await error("Account is inactive", 403, request, env);
+      }
+
+      if (e?.code === "suspended") {
+        return await error("Account is suspended", 403, request, env);
       }
 
       if (e?.code === "forbidden") {
-        return error("Forbidden", 403, request, env);
+        return await error("Forbidden", 403, request, env);
       }
 
-      return error("Internal server error", 500, request, env);
+      return await error("Internal server error", 500, request, env);
     }
   }
 };
