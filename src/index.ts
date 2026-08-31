@@ -2949,7 +2949,8 @@ async function getHeroAds(
     {
       hero_ads: heroAds
     },
-    request
+    request,
+    env
   );
 }
 
@@ -2969,7 +2970,8 @@ async function createHeroAd(
     return error(
       "title is required",
       400,
-      request
+      request,
+      env
     );
   }
 
@@ -3029,7 +3031,8 @@ async function createHeroAd(
       message:
         "Hero ad created"
     },
-    request
+    request,
+    env
   );
 }
 
