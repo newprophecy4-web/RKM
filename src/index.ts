@@ -1,6 +1,3 @@
-// Cloudflare Worker API entrypoint converted from pasted JavaScript.
-// @ts-nocheck
-
 /* =======================================================
    RESPONSE HELPERS
 ======================================================= */
@@ -125,7 +122,7 @@ function getCookie(request, name) {
 }
 
 function sessionCookie(token, maxAge = SESSION_DAYS * 24 * 60 * 60) {
-  return `session=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`;
+  return `session=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=${maxAge}`;
 }
 
 async function sha256(value) {
