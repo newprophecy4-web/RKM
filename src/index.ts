@@ -1,3 +1,5 @@
+import { SignJWT, jwtVerify } from "jose";
+
 /* =======================================================
    RESPONSE HELPERS
 ======================================================= */
@@ -103,26 +105,18 @@ class ApiAuthError extends Error {
    D1 SESSION AUTHENTICATION
 ======================================================= */
 
-const SESSION_DAYS = 7;
+const JWT_ISSUER = "rkm-worker";
+const JWT_AUDIENCE = "rkm-portal";
 const PASSWORD_ITERATIONS = 100000;
 
 function authError(message, code) {
   return new ApiAuthError(message, code);
 }
 
-function getCookie(request, name) {
-  const header = request.headers.get("Cookie") || "";
-  const match = header.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
-  if (!match) return null;
-  try {
-    return decodeURIComponent(match[1]);
-  } catch {
-    return "";
-  }
-}
-
-function sessionCookie(token, maxAge = SESSION_DAYS * 24 * 60 * 60) {
-  return `session=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=${maxAge}`;
+function getBearerToken(request) {
+  const header = request.headers.get("Authorization") || "";
+  const match = header.match(/^Bearer\s+([A-Za-z0-9._~-]+)$/i);
+  return match ? match[1] : null;
 }
 
 async function sha256(value) {
@@ -141,6 +135,25 @@ function base64(bytes) {
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+function jwtSecret(env) {
+  const secret = String(env?.JWT_SECRET || "");
+  if (secret.length < 32) throw new Error("JWT_SECRET is not configured");
+  return new TextEncoder().encode(secret);
+}
+
+async function createAccessToken(user, env) {
+  return await new SignJWT({
+    sub: String(user.id),
+    tokenType: "access"
+  })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setIssuedAt()
+    .setIssuer(JWT_ISSUER)
+    .setAudience(JWT_AUDIENCE)
+    // Deliberately no .setExpirationTime(): this JWT does not expire automatically.
+    .sign(jwtSecret(env));
+}
+
 async function hashPassword(password, salt = base64(randomBytes())) {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: new TextEncoder().encode(salt), iterations: PASSWORD_ITERATIONS, hash: "SHA-256" }, key, 256);
@@ -157,32 +170,40 @@ async function verifyPassword(password, encoded) {
 }
 
 function publicUser(user) {
-  return { id: user.id, name: user.name, email: user.email, role: user.role, status: user.status };
+  return { id: user.id, name: user.name, email: user.email, phone: user.phone || null, photo_url: user.photo_url || null, role: user.role, status: user.status, created_at: user.created_at, updated_at: user.updated_at, last_login_at: user.last_login_at };
 }
 
 async function authenticate(request, env) {
-  const token = getCookie(request, "session");
-  if (token === null) throw authError("Unauthorized", "unauthorized");
-  if (!token) throw authError("Invalid or expired session", "invalid_session");
+  const token = getBearerToken(request);
+  if (!token) throw authError("Unauthorized", "unauthorized");
 
-  let tokenHash;
+  let payload;
   try {
-    tokenHash = await sha256(token);
-    const session = await env.DB.prepare(`SELECT id, user_id, expires_at FROM sessions WHERE token_hash = ? LIMIT 1`).bind(tokenHash).first();
-    if (!session || !session.expires_at || new Date(session.expires_at).getTime() <= Date.now()) {
-      throw authError("Invalid or expired session", "invalid_session");
-    }
-    const user = await env.DB.prepare(`SELECT * FROM users WHERE id = ? LIMIT 1`).bind(session.user_id).first();
-    if (!user) throw authError("Invalid or expired session", "invalid_session");
-    if (user.status === "inactive") throw authError("Account is inactive", "inactive");
-    if (user.status === "suspended") throw authError("Account is suspended", "suspended");
-    if (user.status !== "active") throw authError("Unauthorized", "unauthorized");
-    await env.DB.prepare(`UPDATE sessions SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(session.id).run();
-    return { user, session };
-  } catch (e) {
-    if (e instanceof ApiAuthError) throw e;
-    throw e;
+    const verified = await jwtVerify(token, jwtSecret(env), {
+      algorithms: ["HS256"],
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE
+    });
+    payload = verified.payload;
+  } catch {
+    throw authError("Invalid Bearer token", "invalid_session");
   }
+
+  const userId = typeof payload.sub === "string" ? payload.sub : "";
+  if (!userId || payload.tokenType !== "access") throw authError("Invalid Bearer token", "invalid_session");
+
+  const tokenHash = await sha256(token);
+  const session = await env.DB.prepare(`SELECT id, user_id FROM sessions WHERE token_hash = ? LIMIT 1`).bind(tokenHash).first();
+  if (!session || session.user_id !== userId) throw authError("Invalid session", "invalid_session");
+
+  const user = await env.DB.prepare(`SELECT * FROM users WHERE id = ? LIMIT 1`).bind(userId).first();
+  if (!user) throw authError("Invalid session", "invalid_session");
+  if (user.status === "inactive") throw authError("Account is inactive", "inactive");
+  if (user.status === "suspended") throw authError("Account is suspended", "suspended");
+  if (user.status !== "active") throw authError("Unauthorized", "unauthorized");
+
+  await env.DB.prepare(`UPDATE sessions SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(session.id).run();
+  return { user, session, token, payload };
 }
 
 async function requireAdmin(request, env) {
@@ -202,19 +223,16 @@ async function authLogin(request, env) {
   if (user.status === "inactive") return error("Account is inactive", 403, request, env);
   if (user.status === "suspended") return error("Account is suspended", 403, request, env);
   if (user.status !== "active") return error("Invalid credentials", 401, request, env);
-  const token = base64(randomBytes(32));
-  await env.DB.prepare(`INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, last_used_at) VALUES (?, ?, ?, datetime('now', '+7 days'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).bind(id("session"), user.id, await sha256(token)).run();
-  const response = ok({ user: publicUser(user) }, request, env);
-  response.headers.set("Set-Cookie", sessionCookie(token));
-  return response;
+
+  const accessToken = await createAccessToken(user, env);
+  await env.DB.prepare(`INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, last_used_at) VALUES (?, ?, ?, datetime('now', '+100 years'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).bind(id("session"), user.id, await sha256(accessToken)).run();
+  return ok({ accessToken, tokenType: "Bearer", user: publicUser(user) }, request, env);
 }
 
 async function authLogout(request, env) {
-  const token = getCookie(request, "session");
+  const token = getBearerToken(request);
   if (token) await env.DB.prepare(`DELETE FROM sessions WHERE token_hash = ?`).bind(await sha256(token)).run();
-  const response = ok({ message: "Logged out successfully" }, request, env);
-  response.headers.set("Set-Cookie", sessionCookie("", 0));
-  return response;
+  return ok({ message: "Logged out successfully" }, request, env);
 }
 
 async function authRegister(request, env) {
@@ -223,9 +241,7 @@ async function authRegister(request, env) {
   const email = typeof data.email === "string" ? data.email.trim().toLowerCase() : "";
   const password = typeof data.password === "string" ? data.password : "";
   const phone = typeof data.phone === "string" ? data.phone.trim() : null;
-  if (!name || name.length > 160 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 320 || password.length < 6 || password.length > 4096) {
-    return error("Invalid registration details", 400, request, env);
-  }
+  if (!name || name.length > 160 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 320 || password.length < 6 || password.length > 4096) return error("Invalid registration details", 400, request, env);
   const existing = await env.DB.prepare(`SELECT id FROM users WHERE LOWER(email) = ? LIMIT 1`).bind(email).first();
   if (existing) return error("An account with this email already exists", 409, request, env);
 
@@ -235,11 +251,9 @@ async function authRegister(request, env) {
   const user = await env.DB.prepare(`SELECT * FROM users WHERE id = ? LIMIT 1`).bind(userId).first();
   if (!user) throw new Error("User creation failed");
 
-  const token = base64(randomBytes(32));
-  await env.DB.prepare(`INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, last_used_at) VALUES (?, ?, ?, datetime('now', '+7 days'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).bind(id("session"), user.id, await sha256(token)).run();
-  const response = ok({ user: publicUser(user) }, request, env);
-  response.headers.set("Set-Cookie", sessionCookie(token));
-  return response;
+  const accessToken = await createAccessToken(user, env);
+  await env.DB.prepare(`INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, last_used_at) VALUES (?, ?, ?, datetime('now', '+100 years'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).bind(id("session"), user.id, await sha256(accessToken)).run();
+  return ok({ accessToken, tokenType: "Bearer", user: publicUser(user) }, request, env);
 }
 
 async function updateMe(request, env) {
@@ -3320,7 +3334,7 @@ async function getMe(
   return ok(
     {
       user:
-        auth.user
+        publicUser(auth.user)
     },
     request
   );
