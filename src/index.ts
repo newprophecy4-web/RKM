@@ -5,10 +5,20 @@ import { SignJWT, jwtVerify } from "jose";
 ======================================================= */
 
 function allowedOrigins(env) {
-  return String(env?.CORS_ORIGINS || env?.CORS_ORIGIN || "https://rkm.newprophecy4.workers.dev,http://localhost:5173,http://localhost:3000")
+  const configured = String(env?.CORS_ORIGINS || env?.CORS_ORIGIN || "")
     .split(",")
     .map((origin) => origin.trim())
     .filter((origin) => origin && origin !== "*" && origin !== "null");
+
+  const requiredFrontendOrigin = "https://ais-pre-4msgr2nswmlypx42smi7zb-400902016744.asia-east1.run.app";
+  const workerOrigin = "https://rkm.newprophecy4.workers.dev";
+  return [...new Set([
+    requiredFrontendOrigin,
+    workerOrigin,
+    "http://localhost:5173",
+    "http://localhost:3000",
+    ...configured
+  ])];
 }
 
 function corsHeaders(request, env) {
@@ -105,15 +115,13 @@ class ApiAuthError extends Error {
    D1 SESSION AUTHENTICATION
 ======================================================= */
 
-const JWT_ISSUER = "rkm-worker";
-const JWT_AUDIENCE = "rkm-portal";
 const PASSWORD_ITERATIONS = 100000;
 
 function authError(message, code) {
   return new ApiAuthError(message, code);
 }
 
-function getBearerToken(request) {
+function getBearer(request) {
   const header = request.headers.get("Authorization") || "";
   const match = header.match(/^Bearer\s+([A-Za-z0-9._~-]+)$/i);
   return match ? match[1] : null;
@@ -144,13 +152,11 @@ function jwtSecret(env) {
 async function createAccessToken(user, env) {
   return await new SignJWT({
     sub: String(user.id),
-    tokenType: "access"
+    email: String(user.email),
+    role: String(user.role)
   })
     .setProtectedHeader({ alg: "HS256", typ: "JWT" })
-    .setIssuedAt()
-    .setIssuer(JWT_ISSUER)
-    .setAudience(JWT_AUDIENCE)
-    // Deliberately no .setExpirationTime(): this JWT does not expire automatically.
+    // This JWT is intentionally non-expiring. Session revocation is controlled by D1.
     .sign(jwtSecret(env));
 }
 
@@ -174,23 +180,24 @@ function publicUser(user) {
 }
 
 async function authenticate(request, env) {
-  const token = getBearerToken(request);
+  const token = getBearer(request);
   if (!token) throw authError("Unauthorized", "unauthorized");
 
+  // Resolve configuration outside the verification catch so a missing secret is a
+  // safe server configuration error, not an authentication failure.
+  const secret = jwtSecret(env);
   let payload;
   try {
-    const verified = await jwtVerify(token, jwtSecret(env), {
-      algorithms: ["HS256"],
-      issuer: JWT_ISSUER,
-      audience: JWT_AUDIENCE
+    const verified = await jwtVerify(token, secret, {
+      algorithms: ["HS256"]
     });
     payload = verified.payload;
   } catch {
-    throw authError("Invalid Bearer token", "invalid_session");
+    throw authError("Unauthorized", "invalid_session");
   }
 
   const userId = typeof payload.sub === "string" ? payload.sub : "";
-  if (!userId || payload.tokenType !== "access") throw authError("Invalid Bearer token", "invalid_session");
+  if (!userId) throw authError("Unauthorized", "invalid_session");
 
   const tokenHash = await sha256(token);
   const session = await env.DB.prepare(`SELECT id, user_id FROM sessions WHERE token_hash = ? LIMIT 1`).bind(tokenHash).first();
@@ -230,7 +237,7 @@ async function authLogin(request, env) {
 }
 
 async function authLogout(request, env) {
-  const token = getBearerToken(request);
+  const token = getBearer(request);
   if (token) await env.DB.prepare(`DELETE FROM sessions WHERE token_hash = ?`).bind(await sha256(token)).run();
   return ok({ message: "Logged out successfully" }, request, env);
 }
@@ -516,7 +523,7 @@ async function root(request, env) {
         "running",
 
       authentication:
-        "D1 session authentication",
+        "JWT Bearer authentication with D1 session revocation",
 
       database:
         "Cloudflare D1"
@@ -545,7 +552,8 @@ async function health(request, env) {
         database: "ok",
         time: now()
       },
-      request
+      request,
+      env
     );
 
   } catch (e) {
@@ -4797,7 +4805,7 @@ export default {
       }
 
       if (e?.code === "invalid_session") {
-        return await error("Invalid or expired session", 401, request, env);
+        return await error("Unauthorized", 401, request, env);
       }
 
       if (e?.code === "inactive") {
